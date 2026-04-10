@@ -1,13 +1,11 @@
-"""Click CLI for manual sync operations, status checks, and conflict resolution."""
+"""Click CLI for manual sync operations and status checks."""
 
 import logging
 import sys
-import threading
 
 import click
 
 import config
-from pa_bridge import create_webhook_app, set_reverse_callback
 from state_db import SyncStateDB
 from sync_engine import SyncEngine
 
@@ -21,30 +19,27 @@ logger = logging.getLogger(__name__)
 
 @click.group()
 def cli():
-    """Notion ↔ OneNote Class Notebook sync tool."""
+    """Notion -> OneNote Class Notebook sync tool."""
     pass
 
 
 @cli.command()
-@click.option("--direction", type=click.Choice(["forward", "reverse", "both"]), default="forward")
 @click.option("--full", is_flag=True, help="Ignore last-sync timestamps and sync everything.")
 @click.option("--force", is_flag=True, help="Alias for --full.")
-def sync(direction: str, full: bool, force: bool):
-    """Run a sync cycle."""
+def sync(full: bool, force: bool):
+    """Run a forward sync (Notion -> OneNote)."""
     full = full or force
     engine = SyncEngine()
 
-    if direction in ("forward", "both"):
-        click.echo("Running forward sync (Notion → OneNote)...")
-        stats = engine.forward_sync(full=full)
-        click.echo(
-            f"  Created: {stats['created']}  Updated: {stats['updated']}  "
-            f"Skipped: {stats['skipped']}  Errors: {stats['errors']}"
-        )
-
-    if direction in ("reverse", "both"):
-        click.echo("Reverse sync runs via the webhook server.")
-        click.echo("Use 'cli.py serve' to start the webhook listener.")
+    click.echo("Running forward sync (Notion -> OneNote)...")
+    stats = engine.forward_sync(full=full)
+    click.echo(
+        f"  Created: {stats['created']}  Updated: {stats['updated']}  "
+        f"Skipped: {stats['skipped']}  Errors: {stats['errors']}  "
+        f"Sections: {stats['sections_created']}"
+    )
+    if stats["errors"] > 0:
+        sys.exit(1)
 
 
 @cli.command()
@@ -58,7 +53,7 @@ def status():
     click.echo(f"Total tracked pages: {total}")
     click.echo(f"Last sync:           {last_sync or 'never'}")
     click.echo()
-    for s in ("synced", "pending", "conflict", "error"):
+    for s in ("synced", "pending", "error"):
         click.echo(f"  {s:>10}: {counts.get(s, 0)}")
 
     errors = db.get_errors()
@@ -70,38 +65,6 @@ def status():
 
 
 @cli.command()
-def conflicts():
-    """List all pages in conflict state."""
-    db = SyncStateDB()
-    rows = db.get_conflicts()
-    if not rows:
-        click.echo("No conflicts.")
-        return
-
-    click.echo(f"{len(rows)} conflicted page(s):\n")
-    for r in rows:
-        click.echo(f"  Notion ID:  {r['notion_page_id']}")
-        click.echo(f"  Title:      {r['notion_title'] or '(untitled)'}")
-        click.echo(f"  Last edit:  Notion={r['last_notion_edit']}  OneNote={r['last_onenote_edit']}")
-        click.echo(f"  Last sync:  {r['last_synced']}")
-        click.echo()
-
-
-@cli.command()
-@click.argument("notion_page_id")
-@click.option("--keep", type=click.Choice(["notion", "onenote"]), required=True)
-def resolve(notion_page_id: str, keep: str):
-    """Resolve a conflict by choosing which side to keep."""
-    engine = SyncEngine()
-    try:
-        engine.resolve_conflict(notion_page_id, keep=keep)
-        click.echo(f"Resolved: keeping {keep} version for {notion_page_id}")
-    except ValueError as e:
-        click.echo(f"Error: {e}", err=True)
-        sys.exit(1)
-
-
-@cli.command()
 def pages():
     """List all tracked pages."""
     db = SyncStateDB()
@@ -110,28 +73,37 @@ def pages():
         click.echo("No pages tracked yet.")
         return
 
-    click.echo(f"{'Title':<40} {'Status':<10} {'Source':<10} {'Last Synced'}")
+    click.echo(f"{'Title':<40} {'Status':<10} {'Section':<10} {'Last Synced'}")
     click.echo("-" * 90)
     for r in rows:
         title = (r["notion_title"] or "(untitled)")[:38]
+        level = r.get("page_level", -1)
+        indent = "  " * max(0, level + 1) if level >= 0 else ""
+        section = "section" if level == -1 else f"L{level}"
         click.echo(
-            f"{title:<40} {r['sync_status']:<10} {r['last_source'] or '-':<10} {r['last_synced'] or '-'}"
+            f"{indent}{title:<{40 - len(indent)}} {r['sync_status']:<10} {section:<10} {r['last_synced'] or '-'}"
         )
 
 
 @cli.command()
-@click.option("--port", default=None, type=int, help=f"Port to listen on (default: {config.FLASK_PORT})")
-def serve(port):
-    """Start the reverse sync webhook server."""
-    port = port or config.FLASK_PORT
-    engine = SyncEngine()
-    set_reverse_callback(engine.reverse_sync_page)
+def retry_errors():
+    """Re-sync all pages currently in error state."""
+    db = SyncStateDB()
+    errors = db.get_errors()
+    if not errors:
+        click.echo("No pages in error state.")
+        return
 
-    app = create_webhook_app()
-    click.echo(f"Starting webhook server on port {port}...")
-    click.echo(f"  POST /webhook/onenote — OneNote change receiver")
-    click.echo(f"  GET  /health          — Health check")
-    app.run(host="0.0.0.0", port=port)
+    click.echo(f"Resetting {len(errors)} errored page(s) to pending...")
+    for e in errors:
+        db.set_status(e["notion_page_id"], "pending")
+
+    engine = SyncEngine()
+    stats = engine.forward_sync(full=True)
+    click.echo(
+        f"  Created: {stats['created']}  Updated: {stats['updated']}  "
+        f"Skipped: {stats['skipped']}  Errors: {stats['errors']}"
+    )
 
 
 @cli.command()

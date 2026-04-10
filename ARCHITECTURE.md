@@ -1,69 +1,75 @@
-# Notion ↔ OneNote Class Notebook Sync System
+# Notion → OneNote Class Notebook Sync System
 
-**Architecture Document — March 2026 — v1.0**
+**Architecture Document — March 2026 — v2.0**
 
 | Direction | Trigger | Infrastructure |
 |-----------|---------|----------------|
-| Bidirectional | Scheduled + Manual | Raspberry Pi + Power Automate |
+| One-way (Notion → OneNote) | Scheduled + Manual | Raspberry Pi + Power Automate |
 
 ---
 
 ## 1. System Overview
 
-This document describes a hybrid sync system that keeps a Notion database in sync with your personal section in a OneNote Class Notebook. The primary direction is Notion → OneNote (pushing your notes to the class notebook), with a secondary reverse flow for OneNote → Notion.
+This system pushes notes from a Notion database into your personal section group within a OneNote Class Notebook. Notion is the source of truth; OneNote is a read-only destination.
 
 ### 1.1 Why Hybrid?
 
-School M365 accounts typically restrict Azure AD app registrations, which blocks direct Graph API access via custom apps. Power Automate sidesteps this because it uses delegated permissions under your school identity. However, Power Automate has no native Notion connector, so a Pi-hosted script handles the Notion side.
+School M365 accounts restrict Azure AD app registrations, which blocks direct Graph API access. Power Automate sidesteps this because it uses delegated permissions under your school identity. However, Power Automate has no native Notion connector, so a Pi-hosted script handles the Notion side.
 
-> **Key Insight:** Power Automate acts as an authenticated bridge to the Microsoft Graph API. Your Pi script talks to Notion directly (API key) and to OneNote indirectly (via Power Automate webhook URLs). This avoids Azure AD app registration entirely.
+> **Key constraint:** The OneNote (Business) connector's "Create section" action targets notebooks but cannot target a specific *section group* within a Class Notebook. The SharePoint HTTP proxy (`_api/v2.0`) does not route OneNote Graph endpoints. The workaround: create sections in a personal OneDrive notebook, then copy the `.one` file into the Class Notebook's SharePoint folder.
 
-### 1.2 Architecture Overview
+### 1.2 Architecture Diagram
 
 ```
-┌──────────────────┐       ┌──────────────────────┐       ┌──────────────────┐
-│    Notion API    │       │    Raspberry Pi       │       │  Power Automate  │
-│  Database+Pages  │ ◄───► │  Python Sync Engine   │ ◄───► │  Graph API Bridge │
-└──────────────────┘       └──────────────────────┘       └──────────────────┘
-                                     │
-                                     ▼
-                    ┌────────────────────────────────┐
-                    │   OneNote Class Notebook        │
-                    │   Your Personal Section         │
-                    │   Microsoft Graph API           │
-                    └────────────────────────────────┘
+┌──────────────────┐       ┌──────────────────────┐       ┌───────────────────────┐
+│    Notion API    │       │    Raspberry Pi       │       │   Power Automate      │
+│  Database+Pages  │ ────► │  Python Sync Engine   │ ────► │   OneNote Bridge      │
+└──────────────────┘       └──────────────────────┘       └───────────────────────┘
+                                     │                              │
+                                     │                              ▼
+                                     │                   ┌──────────────────────┐
+                                     │                   │  OneNote Class       │
+                                     └──────────────────►│  Notebook Section    │
+                                      (via PA webhook)   │  Group               │
+                                                         └──────────────────────┘
 ```
+
+### 1.3 Key IDs
+
+| Resource | ID |
+|----------|-----|
+| Class Notebook | `1-af3a0c0f-09c4-469a-bcbd-63668f2d4fc4` |
+| Section Group (Sean Cassidy - LDE Learner) | `1-8874ae71-b532-4325-8454-9f796173a39e` |
+| SharePoint site collection | `0436759b-4ed4-4e50-8500-6bb97acd351d` |
+| SharePoint site | `72c4d145-1ad1-49fc-b664-53275e3cf578` |
+| SharePoint destination path | `/sites/PsychologyKS525-27/SiteAssets/Psychology KS5 25-27 Notebook/Sean Cassidy - LDE Learner/` |
+| Personal OneDrive notebook path | `Documents/Sean @ London Design and Engineering UTC/` |
 
 ---
 
-## 2. Data Flow
-
-### 2.1 Notion → OneNote (Primary)
-
-Your Notion database entries (lesson plans, notes) are converted to HTML and pushed into OneNote pages within your Class Notebook section.
+## 2. Data Flow (Notion → OneNote)
 
 | Step | Component | Action |
 |------|-----------|--------|
-| 1 | Pi – Cron / Manual | Triggers sync script (cron every 30 min, or CLI manual trigger) |
-| 2 | Pi – Notion Client | Queries Notion database API for pages modified since last sync |
-| 3 | Pi – Block Parser | Fetches full block tree for each changed page, converts to OneNote-compatible HTML |
-| 4 | Pi – HTTP POST | Sends page title + HTML body to Power Automate webhook URL |
-| 5 | Power Automate | Receives webhook, creates or updates OneNote page via Graph connector |
-| 6 | Pi – State DB | Records sync timestamp + page mapping (Notion ID ↔ OneNote page ID) |
+| 1 | Pi — Cron / Manual | Triggers sync script (cron every 30 min, or CLI) |
+| 2 | Pi — Notion Client | Queries Notion database for pages modified since last sync |
+| 3 | Pi — Tree Builder | Builds parent-child hierarchy; root pages → OneNote sections, children → indented pages |
+| 4 | Pi — Block Converter | Converts Notion blocks to OneNote-compatible HTML |
+| 5 | Pi — Webhook Caller | POSTs `{ section_name, page_title, html_body, notion_page_id, action, ... }` to PA |
+| 6 | Power Automate | Receives webhook, handles section creation (via .one copy workaround if needed), creates/updates page |
+| 7 | PA → Pi | Returns `{ onenote_page_id, onenote_section_id, status }` |
+| 8 | Pi — State DB | Records page mapping, content hash, section ID |
 
-### 2.2 OneNote → Notion (Secondary)
+### 2.1 Hierarchy Mapping
 
-Reverse sync is trickier because OneNote's API is append-heavy and change detection is limited. We use Power Automate's OneNote trigger to detect modifications, then relay content back to the Pi.
+Notion's database has a self-referencing "Parent item" relation. The sync engine builds a tree and maps it to OneNote:
 
-| Step | Component | Action |
-|------|-----------|--------|
-| 1 | Power Automate | Trigger: "When a page is modified" in your Class Notebook section |
-| 2 | Power Automate | Fetches page content via OneNote connector, POSTs to Pi webhook (Cloudflare Tunnel) |
-| 3 | Pi – Flask Webhook | Receives page data, parses OneNote HTML back to structured content |
-| 4 | Pi – Notion Client | Updates corresponding Notion page (looked up via state DB mapping) |
-| 5 | Pi – State DB | Updates sync record, marks as "source: onenote" to prevent echo loops |
-
-> **Echo Loop Prevention:** Each sync record stores the source of the last modification (`notion` or `onenote`). When the forward sync runs, it skips pages where source = onenote and the content hash hasn't changed. Same logic in reverse. This prevents infinite ping-pong updates.
+| Notion Level | OneNote Equivalent | `page_level` value |
+|-------------|-------------------|-------------------|
+| Root page (depth 0) | OneNote section + level-0 page | -1 (section marker) |
+| Child (depth 1) | Page at level 0 in parent's section | 0 |
+| Grandchild (depth 2) | Page at level 1 | 1 |
+| Great-grandchild+ (depth 3+) | Page at level 2 (capped) | 2 |
 
 ---
 
@@ -71,354 +77,391 @@ Reverse sync is trickier because OneNote's API is append-heavy and change detect
 
 ### 3.1 Pi Sync Engine (Python)
 
-**Language:** Python 3.11+  
+**Runtime:** Python 3.9+
 **Location:** `~/notion-onenote-sync/`
 
 | Module | Responsibility |
 |--------|---------------|
-| `sync_engine.py` | Main orchestrator. Runs forward and reverse sync, manages state. |
-| `notion_api.py` | Wraps the Notion API. Queries database, fetches block trees, creates/updates pages. |
-| `block_converter.py` | Converts Notion blocks ↔ OneNote HTML. Handles headings, paragraphs, lists, code blocks, callouts, toggles, images. |
-| `pa_bridge.py` | HTTP client for Power Automate webhooks. Sends page data for forward sync, exposes Flask endpoint for reverse sync. |
-| `state_db.py` | SQLite database tracking page mappings, last sync times, content hashes, and modification sources. |
-| `cli.py` | Click-based CLI for manual sync, status checks, and forced full re-sync. |
+| `sync_engine.py` | Forward-only orchestrator. Builds page tree, drives section/page creation. |
+| `notion_api.py` | Notion API wrapper. Queries database, fetches blocks, builds page tree. |
+| `block_converter.py` | Notion blocks → OneNote HTML. Callout tables, rich text, headings, lists, code, toggles, images. |
+| `pa_bridge.py` | HTTP client for PA webhook. Retry with exponential backoff. |
+| `state_db.py` | SQLite state tracking: page mappings, content hashes, section IDs. |
+| `cli.py` | Click CLI: `sync`, `status`, `pages`, `retry-errors`, `init`. |
+| `config.py` | Loads `.env`, defines constants. |
 
 ### 3.2 State Database Schema
 
-SQLite database stored at `~/notion-onenote-sync/sync_state.db`
+SQLite at `~/notion-onenote-sync/sync_state.db`
 
 | Column | Type | Description |
 |--------|------|-------------|
-| `id` | INTEGER PK | Auto-increment row ID |
+| `id` | INTEGER PK | Auto-increment |
 | `notion_page_id` | TEXT UNIQUE | Notion page UUID |
-| `onenote_page_id` | TEXT | OneNote page ID (from Graph API) |
-| `notion_title` | TEXT | Page title (for quick lookups) |
-| `last_notion_edit` | DATETIME | Last modification time from Notion API |
-| `last_onenote_edit` | DATETIME | Last modification time from Graph API |
-| `last_synced` | DATETIME | When sync last ran for this page |
-| `content_hash` | TEXT | SHA-256 hash of normalised content (for diff detection) |
-| `last_source` | TEXT | Which side last modified: "notion" or "onenote" |
-| `sync_status` | TEXT | Current status: synced, pending, conflict, error |
+| `onenote_page_id` | TEXT | OneNote page ID (from PA response) |
+| `notion_title` | TEXT | Page title |
+| `last_notion_edit` | DATETIME | Last modification from Notion API |
+| `last_synced` | DATETIME | When this page was last synced |
+| `content_hash` | TEXT | SHA-256 of normalised block content |
+| `last_source` | TEXT | Always "notion" (one-way sync) |
+| `sync_status` | TEXT | synced, pending, error |
+| `parent_notion_id` | TEXT | Notion page ID of the parent page |
+| `onenote_section_id` | TEXT | OneNote section ID (set on root pages) |
+| `page_level` | INTEGER | -1 for sections, 0–2 for page indent level |
 
-### 3.3 Power Automate Flows
+### 3.3 Webhook Payload
 
-You will need two separate flows in Power Automate, both running under your school M365 account.
-
-**Flow 1: Notion → OneNote (Webhook Receiver)**
-
-- **Trigger:** HTTP Request (When an HTTP request is received)
-- Receives a JSON payload from the Pi containing the page title, HTML body, and an optional existing OneNote page ID
-- If a page ID is provided, it updates; otherwise it creates a new page in your Class Notebook section
-- Returns the OneNote page ID in the response
-
-**Flow 2: OneNote → Notion (Change Relay)**
-
-- **Trigger:** When a OneNote page is modified in a section
-- Fetches the page content via the OneNote connector
-- POSTs the HTML + page ID to your Pi's webhook endpoint (exposed via Cloudflare Tunnel)
-- The Pi handles conversion and Notion update
-
-### 3.4 Block Conversion Matrix
-
-Mapping between Notion block types and OneNote HTML elements:
-
-| Notion Block | OneNote HTML | Reverse? |
-|-------------|-------------|----------|
-| `paragraph` | `<p>text</p>` | Yes |
-| `heading_1` | `<h1>text</h1>` | Yes |
-| `heading_2` | `<h2>text</h2>` | Yes |
-| `heading_3` | `<h3>text</h3>` | Yes |
-| `bulleted_list_item` | `<ul><li>text</li></ul>` | Yes |
-| `numbered_list_item` | `<ol><li>text</li></ol>` | Yes |
-| `to_do` | `<p data-tag="to-do">text</p>` | Yes |
-| `code` | `<pre><code>text</code></pre>` | Partial |
-| `quote` | `<blockquote>text</blockquote>` | Partial |
-| `callout` | Styled `<table>` with icon + colour + nested children (see §3.5) | Yes (round-trip) |
-| `toggle` | Flattened to heading + indented content | No |
-| `image` | `<img src="..." />` | Yes (re-upload) |
-| `divider` | `<hr />` | Yes |
-| `table` | `<table>...</table>` | Yes |
-
-> **Rich Text Handling:** Notion's rich text annotations (bold, italic, code, strikethrough, underline, colour) map to inline HTML tags: `<b>`, `<i>`, `<code>`, `<s>`, `<u>`, and `<span style="color:...">`. Links become `<a href="...">`. The reverse parser strips OneNote-specific styling and maps back to Notion annotations.
-
-### 3.5 Callout Conversion (Detailed)
-
-Since callouts are the primary note-taking pattern, this is the most critical conversion in the system. The converter must handle icons, background colours, nested child blocks, and round-trip back to Notion with no data loss.
-
-#### Notion Callout Structure
-
-A Notion callout block looks like this from the API:
+The Pi sends this JSON to Power Automate:
 
 ```json
 {
-  "type": "callout",
-  "callout": {
-    "rich_text": [{ "type": "text", "text": { "content": "Main callout text" } }],
-    "icon": { "type": "emoji", "emoji": "💡" },
-    "color": "blue_background",
-    "children": [
-      { "type": "paragraph", "paragraph": { "rich_text": [...] } },
-      { "type": "bulleted_list_item", ... },
-      { "type": "callout", ... }  // nested callouts are possible
-    ]
+  "section_name": "Social Influence",
+  "page_title": "Conformity",
+  "html_body": "<html>...<body>...</body></html>",
+  "notion_page_id": "abc123-def456",
+  "action": "create",
+  "onenote_page_id": null,
+  "onenote_section_id": "1-abc-def",
+  "page_level": 0
+}
+```
+
+| Field | Description |
+|-------|-------------|
+| `section_name` | Topic name — becomes the OneNote section name |
+| `page_title` | Page title within the section |
+| `html_body` | Full OneNote-compatible HTML |
+| `notion_page_id` | Tracking ID |
+| `action` | `"create"` or `"update"` |
+| `onenote_page_id` | Existing page ID (for updates, null for creates) |
+| `onenote_section_id` | Known section ID (skip lookup if provided) |
+| `page_level` | 0, 1, or 2 — page indent level |
+
+Power Automate responds with:
+
+```json
+{
+  "onenote_page_id": "1-xyz-789",
+  "onenote_section_id": "1-abc-def",
+  "status": "success"
+}
+```
+
+---
+
+## 4. Power Automate Flow (Single Flow)
+
+### 4.1 Overview
+
+One flow handles everything: section creation (with .one file copy workaround), page creation, and page updates.
+
+```
+HTTP trigger (webhook from Pi)
+│
+├─ Is onenote_section_id provided?
+│   ├─ YES → use it directly
+│   └─ NO  → Get sections in Class Notebook
+│            ├─ Filter by section_name
+│            ├─ Found? → use existing section ID
+│            └─ Not found? → Create section via .one copy
+│
+├─ Is action "create"?
+│   └─ Create page in section with html_body
+│
+├─ Is action "update"?
+│   └─ Update page content (append/replace)
+│
+└─ Response: { onenote_page_id, onenote_section_id, status }
+```
+
+### 4.2 Block-by-Block Flow Design
+
+#### Trigger
+
+**When an HTTP request is received**
+- Method: POST
+- JSON schema:
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "section_name":       { "type": "string" },
+    "page_title":         { "type": "string" },
+    "html_body":          { "type": "string" },
+    "notion_page_id":     { "type": "string" },
+    "action":             { "type": "string" },
+    "onenote_page_id":    { "type": "string" },
+    "onenote_section_id": { "type": "string" },
+    "page_level":         { "type": "integer" }
   }
 }
 ```
 
-Key properties: `icon` (emoji or external URL), `color` (one of Notion's named background colours), `rich_text` (the callout's own text), and `children` (any nested blocks — paragraphs, lists, code, even other callouts).
+#### Step 1: Initialize Variables
 
-#### Notion Colour → CSS Mapping
+- `var_section_id` (String) = `triggerBody()?['onenote_section_id']`
+- `var_onenote_page_id` (String) = `triggerBody()?['onenote_page_id']`
 
-```python
-NOTION_COLOURS = {
-    "default":           ("#F7F6F3", "#37352F"),  # (background, border/accent)
-    "gray_background":   ("#F1F1EF", "#9B9A97"),
-    "brown_background":  ("#F4EEEE", "#9F6B53"),
-    "orange_background": ("#FBECDD", "#D9730D"),
-    "yellow_background": ("#FBF3DB", "#DFAB01"),
-    "green_background":  ("#EDF3EC", "#0F7B6C"),
-    "blue_background":   ("#E7F3F8", "#0B6E99"),
-    "purple_background": ("#F4F0F7", "#6940A5"),
-    "pink_background":   ("#F9EEF3", "#AD1A72"),
-    "red_background":    ("#FDEBEC", "#E03E3E"),
+#### Step 2: Section Resolution
+
+**Condition**: `empty(var_section_id)` is true
+
+**If YES — section ID not known:**
+
+1. **Get sections** (OneNote Business connector)
+   - Action: "Get sections in notebook"
+   - Notebook: Class Notebook (`1-af3a0c0f-09c4-469a-bcbd-63668f2d4fc4`)
+
+2. **Filter array**
+   - From: sections list
+   - Where: `item()?['displayName']` equals `triggerBody()?['section_name']`
+
+3. **Condition**: filter result length > 0
+
+   **If section exists:**
+   - Set `var_section_id` = `first(body('Filter_array'))?['id']`
+
+   **If section does NOT exist → .one file copy workaround:**
+
+   a. **Create section in personal OneDrive notebook** (OneNote Business connector)
+      - Action: "Create section"
+      - Notebook: your personal notebook ("Sean @ London Design and Engineering UTC")
+      - Section name: `triggerBody()?['section_name']`
+
+   b. **Copy file** (SharePoint connector — "Copy file")
+      - Source site: your OneDrive (or use OneDrive connector "Copy file")
+      - Source path: `Documents/Sean @ London Design and Engineering UTC/@{triggerBody()?['section_name']}.one`
+      - Destination site: `PsychologyKS525-27`
+      - Destination path: `/SiteAssets/Psychology KS5 25-27 Notebook/Sean Cassidy - LDE Learner/@{triggerBody()?['section_name']}.one`
+
+   c. **Delay** — 45 seconds
+      - Allows OneNote to register the new `.one` file as a section
+
+   d. **Get sections in notebook** (again)
+      - Same notebook as Step 2.1
+
+   e. **Filter array** (again)
+      - Match on `section_name`
+
+   f. **Set `var_section_id`** = `first(body('Filter_array_2'))?['id']`
+
+   g. **Delete section from personal notebook** (cleanup)
+      - Use OneDrive connector "Delete file"
+      - Path: `Documents/Sean @ London Design and Engineering UTC/@{triggerBody()?['section_name']}.one`
+
+**If NO — section ID was provided:**
+- Skip to Step 3 (section ID already in `var_section_id`)
+
+#### Step 3: Page Create or Update
+
+**Condition**: `triggerBody()?['action']` equals `"create"`
+
+**If CREATE:**
+
+1. **Create page in a section** (OneNote Business connector)
+   - Section: `var_section_id`
+   - Page content: `triggerBody()?['html_body']`
+   
+2. **Set `var_onenote_page_id`** = page ID from create response
+
+**If UPDATE:**
+
+1. **Update page content** (OneNote Business connector)
+   - Action: "Update page content"
+   - Page ID: `var_onenote_page_id`
+   - Content: append `triggerBody()?['html_body']`
+
+   > **Note:** OneNote's update API is append-only. For full content replacement, the Pi should send a delete-and-recreate instruction instead, or use a target element ID. For now, appending works for incremental notes.
+
+#### Step 4: Response
+
+**Response** (HTTP 200):
+
+```json
+{
+  "onenote_page_id": "@{var_onenote_page_id}",
+  "onenote_section_id": "@{var_section_id}",
+  "status": "success"
 }
 ```
 
-#### Forward Conversion: Notion Callout → OneNote HTML
-
-OneNote's Graph API accepts a subset of HTML. It does **not** support `<div>` with arbitrary CSS classes, but it **does** support `<table>` styling reliably. The strategy is to render each callout as a single-row, two-column table: icon cell + content cell, with an inline background colour and a left-border accent.
-
-```python
-def callout_to_onenote_html(block: dict, depth: int = 0) -> str:
-    """Convert a Notion callout block to OneNote-compatible HTML."""
-    callout = block["callout"]
-    
-    # Extract properties
-    icon = get_icon(callout.get("icon"))  # returns emoji string or <img> tag
-    color_key = callout.get("color", "default")
-    bg_color, accent_color = NOTION_COLOURS.get(color_key, NOTION_COLOURS["default"])
-    rich_text_html = rich_text_to_html(callout["rich_text"])
-    
-    # Recursively convert children
-    children_html = ""
-    if "children" in callout:
-        for child in callout["children"]:
-            children_html += block_to_html(child, depth=depth + 1)
-    
-    # Build the callout table
-    # data-notion-type and data-notion-color are round-trip metadata attributes
-    return f'''
-    <table data-notion-type="callout" data-notion-color="{color_key}"
-           style="border-collapse:collapse; width:100%; margin:{4 if depth > 0 else 8}px 0;">
-      <tr>
-        <td data-notion-icon="{icon}" style="
-            width:28px; vertical-align:top; padding:8px 4px 8px 8px;
-            background:{bg_color};
-            border-left:3px solid {accent_color};
-            border-top:1px solid {bg_color};
-            border-bottom:1px solid {bg_color};
-            font-size:18px;">
-          {icon}
-        </td>
-        <td style="
-            vertical-align:top; padding:8px 12px;
-            background:{bg_color};
-            border-right:1px solid {bg_color};
-            border-top:1px solid {bg_color};
-            border-bottom:1px solid {bg_color};">
-          <p style="margin:0 0 4px 0;">{rich_text_html}</p>
-          {children_html}
-        </td>
-      </tr>
-    </table>
-    '''
-```
-
-**Why a table, not a div?** OneNote's HTML rendering engine strips most `<div>` styling and ignores CSS classes entirely. Tables with inline styles are the most reliable way to get consistent visual output in OneNote across desktop, web, and mobile clients.
-
-#### Reverse Conversion: OneNote HTML → Notion Callout
-
-The reverse parser identifies callouts using the `data-notion-type="callout"` attribute embedded during forward conversion. This makes round-tripping lossless for pages that originated in Notion.
-
-```python
-def onenote_html_to_callout(table_element) -> dict:
-    """Parse a OneNote callout table back to a Notion callout block."""
-    # Extract round-trip metadata
-    color_key = table_element.get("data-notion-color", "default")
-    
-    # Icon is in the first <td>
-    icon_cell = table_element.find("td")
-    icon_raw = icon_cell.get("data-notion-icon", "💡")
-    
-    # Content is in the second <td>
-    content_cell = table_element.find_all("td")[1]
-    
-    # First <p> is the callout's own rich text
-    first_p = content_cell.find("p")
-    rich_text = html_to_rich_text(first_p)
-    
-    # Remaining elements are children — recurse
-    children = []
-    for sibling in first_p.find_next_siblings():
-        # Check if it's a nested callout (another table with data-notion-type)
-        if sibling.name == "table" and sibling.get("data-notion-type") == "callout":
-            children.append(onenote_html_to_callout(sibling))
-        else:
-            children.append(html_element_to_notion_block(sibling))
-    
-    return {
-        "type": "callout",
-        "callout": {
-            "rich_text": rich_text,
-            "icon": {"type": "emoji", "emoji": icon_raw},
-            "color": color_key,
-            "children": children,
-        }
-    }
-```
-
-#### Handling Pages Created Directly in OneNote
-
-For pages that were **not** created by the sync engine (e.g. a teacher adds content, or you write directly in OneNote), there are no `data-notion-type` attributes to key off. In this case, the reverse parser uses heuristic detection:
-
-- **Single-row, two-column table** where the first column is narrow (< 40px) and contains only an emoji or small image → treat as a callout
-- **Background colour on cells** → map to the nearest Notion colour using colour distance calculation
-- **Fallback:** if the heuristic isn't confident, import as a regular Notion paragraph with a note in the state DB (`conversion_notes: "possible callout, imported as paragraph"`)
-
-#### Nested Callout Depth Limit
-
-Notion supports arbitrary nesting of callouts. The converter handles up to **3 levels of nesting** (which covers virtually all real usage). Beyond that, nested callouts are flattened into indented paragraphs with a visual marker to prevent excessively deep HTML tables that render poorly in OneNote.
-
-#### Visual Example
-
-A Notion callout like:
+### 4.3 Section Resolution Flowchart
 
 ```
-💡 blue_background
-├── "Key concept: Newton's Third Law"
-├── paragraph: "Every action has an equal and opposite reaction."
-├── bulleted_list_item: "Force pairs act on different objects"
-└── 📝 yellow_background (nested callout)
-    └── "Remember: forces are vectors!"
+┌─────────────────────────────────────────┐
+│ Is onenote_section_id in payload?       │
+│                                         │
+│  YES ──► Use it. Done.                  │
+│                                         │
+│  NO ──► Get all sections in notebook    │
+│         Filter by section_name          │
+│                                         │
+│         Found? ──► Use existing ID      │
+│                                         │
+│         Not found? ──►                  │
+│           1. Create section in personal │
+│              OneDrive notebook          │
+│           2. Copy .one file to Class    │
+│              Notebook SharePoint path   │
+│           3. Wait 45s                   │
+│           4. Get sections again         │
+│           5. Use new section ID         │
+│           6. Delete from personal NB    │
+└─────────────────────────────────────────┘
 ```
 
-Renders in OneNote as a styled table with a blue background, left accent border, 💡 icon, and the nested 📝 callout as an indented yellow table within the content cell.
+---
+
+## 5. Block Conversion Matrix
+
+| Notion Block | OneNote HTML | Notes |
+|-------------|-------------|-------|
+| `paragraph` | `<p>text</p>` | |
+| `heading_1` | `<h1>text</h1>` | |
+| `heading_2` | `<h2>text</h2>` | |
+| `heading_3` | `<h3>text</h3>` | |
+| `bulleted_list_item` | `<ul><li>text</li></ul>` | Adjacent items grouped |
+| `numbered_list_item` | `<ol><li>text</li></ol>` | Adjacent items grouped |
+| `to_do` | `<p data-tag="to-do">text</p>` | Checked state preserved |
+| `code` | `<pre><code>text</code></pre>` | Language in `data-notion-language` |
+| `quote` | `<blockquote>text</blockquote>` | |
+| `callout` | Styled `<table>` (icon + colour + children) | See §5.1 |
+| `toggle` | Heading + indented content (flattened) | Lossy |
+| `image` | `<img src="..." />` | |
+| `divider` | `<hr />` | |
+| `table` | `<table>...</table>` | |
+
+> **Rich text annotations:** bold→`<b>`, italic→`<i>`, code→`<code>`, strike→`<s>`, underline→`<u>`, colour→`<span style>`, link→`<a href>`.
+
+### 5.1 Callout Conversion
+
+Callouts render as a single-row, two-column `<table>`: icon cell + content cell, with inline background colour and left-border accent. The `data-notion-type="callout"` and `data-notion-color` attributes allow lossless round-trip identification.
+
+Nested callouts are supported up to 3 levels deep. Beyond that, content is flattened to indented paragraphs.
 
 ---
 
-## 4. Setup Guide
+## 6. Setup Guide
 
-### 4.1 Notion Integration Setup
+### 6.1 Notion Integration
 
-1. **Create Integration:** Go to [notion.so/my-integrations](https://www.notion.so/my-integrations) and click "New Integration"
-2. **Name it:** Something like "OneNote Sync". Select your workspace. Give it Read content, Update content, and Insert content permissions.
-3. **Copy the token:** Save the Internal Integration Token (starts with `ntn_`). Store this in a `.env` file on the Pi.
-4. **Share your database:** Open your Notion database, click ••• → Connections → add your integration. This grants the integration access to that specific database.
-5. **Note the database ID:** From the database URL: `notion.so/{workspace}/{database_id}?v=...` — copy the 32-character hex ID.
+1. Create at [notion.so/my-integrations](https://www.notion.so/my-integrations) — Read + Update + Insert permissions
+2. Copy the Internal Integration Token (`ntn_...`) into `.env`
+3. Share your database with the integration
+4. Note the database ID from the URL
 
-### 4.2 Power Automate Flow Setup
+### 6.2 Pi Environment
 
-**Flow 1 — Forward Sync (Notion → OneNote):**
+**Prerequisites:** Python 3.9+, pip, SQLite3
 
-1. **Create a new Instant flow** with trigger "When an HTTP request is received"
-2. **Set the JSON schema** for the request body: `{ title: string, html_body: string, onenote_page_id: string|null }`
-3. **Add a Condition** action: check if `onenote_page_id` is null
-4. **If null → Create Page**: Use the OneNote connector "Create page in a section". Select your Class Notebook and your personal section. Pass the HTML body.
-5. **If not null → Update Page**: Use an HTTP action calling `PATCH https://graph.microsoft.com/v1.0/me/onenote/pages/{id}/content` with the update payload.
-6. **Response**: Return the OneNote page ID in the HTTP response body so the Pi can store the mapping.
+```bash
+cd ~/notion-onenote-sync
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+cp .env.example .env
+# Edit .env with your tokens and webhook URL
+python cli.py init
+```
 
-> **Important: OneNote Update Limitations.** The Graph API's PATCH endpoint for OneNote pages only supports appending content and replacing specific elements by ID. You cannot replace the full page body. For significant changes, the sync engine uses a strategy of: (1) append new content, (2) mark old sections for removal. For major rewrites, it's more reliable to delete and recreate the page.
+| Environment Variable | Source |
+|---------------------|--------|
+| `NOTION_TOKEN` | Notion integration page |
+| `NOTION_DATABASE_ID` | Notion database URL |
+| `NOTION_PARENT_PROPERTY` | Name of the parent relation property (default: "Parent") |
+| `PA_FORWARD_WEBHOOK_URL` | Power Automate flow HTTP trigger URL |
 
-**Flow 2 — Reverse Sync (OneNote → Notion):**
+### 6.3 Power Automate Setup
 
-1. **Create an Automated flow** with trigger "When a OneNote page is modified". Select your Class Notebook section.
-2. **Get page content**: Use the OneNote connector to fetch the full page content as HTML.
-3. **HTTP POST**: Send the page ID + HTML body to your Pi's webhook endpoint (e.g. `https://your-tunnel.trycloudflare.com/webhook/onenote`)
-4. **The Pi handles the rest**: conversion + Notion update.
-
-### 4.3 Pi Environment Setup
-
-**Prerequisites:** Python 3.11+, pip, SQLite3 (pre-installed on Raspberry Pi OS)
-
-| Environment Variable | Source | Example |
-|---------------------|--------|---------|
-| `NOTION_TOKEN` | notion.so/my-integrations | `ntn_abc123...` |
-| `NOTION_DATABASE_ID` | Database URL | `a1b2c3d4e5f6...` |
-| `PA_FORWARD_WEBHOOK_URL` | Power Automate Flow 1 | `https://prod-xx.westeurope.logic.azure.com/...` |
-| `PA_REVERSE_WEBHOOK_SECRET` | Your chosen secret | `supersecretkey123` |
-| `FLASK_PORT` | Your choice | `5123` |
-
-**Exposing the Pi webhook:**
-
-- **Option A: Cloudflare Tunnel** (recommended) — you already use Cloudflare for DNS. Run `cloudflared tunnel` to expose your Flask endpoint. Free, stable, no port forwarding needed.
-- **Option B: Tailscale Funnel** — if your Pi is on Tailscale, use Funnel to expose the endpoint. Simple but requires Tailscale.
-- **Option C: ngrok** — quick for testing but the free tier URL changes on restart.
+1. Create a new Instant flow with "When an HTTP request is received" trigger
+2. Paste the JSON schema from §4.2
+3. Build the flow as described in §4.2
+4. Copy the generated HTTP POST URL into your `.env` as `PA_FORWARD_WEBHOOK_URL`
+5. Test with: `python cli.py sync --full`
 
 ---
 
-## 5. Scheduling & Triggers
+## 7. Scheduling & Error Handling
 
-| Trigger | Mechanism | Detail |
-|---------|-----------|--------|
-| Scheduled (forward) | Pi cron job | `*/30 * * * *` — every 30 minutes. Runs `sync_engine.py --direction forward` |
-| Manual (forward) | CLI command | `python cli.py sync --direction forward --force` |
-| Manual (full) | CLI command | `python cli.py sync --direction both --full` (ignores last-sync timestamps) |
-| Automatic (reverse) | Power Automate trigger | Fires on page modification in your OneNote section |
-| Status check | CLI command | `python cli.py status` (shows pending syncs, errors, last run time) |
+### 7.1 Triggers
 
----
+| Trigger | Mechanism | Command |
+|---------|-----------|---------|
+| Scheduled sync | Pi cron job | `*/30 * * * * cd ~/notion-onenote-sync && .venv/bin/python cli.py sync` |
+| Manual sync | CLI | `python cli.py sync` |
+| Full re-sync | CLI | `python cli.py sync --full` |
+| Retry errors | CLI | `python cli.py retry-errors` |
+| Status check | CLI | `python cli.py status` |
 
-## 6. Conflict Resolution
+### 7.2 Retry Logic
 
-Conflicts occur when a page is modified on both sides between syncs. The system handles this conservatively:
-
-- **Last-write-wins with manual override:** By default, the most recently modified version wins. If both sides changed within 5 minutes of each other, the page is marked as "conflict" and skipped until you resolve it via the CLI.
-- **Conflict CLI:** `python cli.py conflicts` lists all conflicted pages. `python cli.py resolve <id> --keep notion|onenote` resolves a conflict by choosing a side.
-- **Content hashing:** SHA-256 of normalised content (stripped of whitespace / formatting differences) prevents false positives where the content is identical but timestamps differ.
-
----
-
-## 7. Known Limitations & Mitigations
-
-| Limitation | Impact | Mitigation |
-|-----------|--------|------------|
-| OneNote pages are append-only (PATCH API) | Cannot fully replace page content | Delete + recreate for major changes; append for minor updates |
-| No native Notion connector in Power Automate | Cannot trigger on Notion changes directly | Pi polls Notion on a schedule; manual trigger for immediate sync |
-| OneNote change trigger may have delay | Reverse sync not instant | Power Automate triggers typically fire within 1–5 minutes |
-| Notion API rate limit: 3 requests/sec | Slow for large databases | Batch queries, respect Retry-After header, incremental sync only |
-| Toggle blocks have no OneNote equivalent | Lossy conversion | Flatten to heading + indented content; marked in state DB as lossy |
-| OneNote images are hosted by Microsoft | Need re-upload to Notion | Download from OneNote URL, upload to Notion via file upload endpoint |
-| School account may restrict PA premium connectors | HTTP connector might be premium | Test first; fallback is using standard connectors only |
+- PA webhook calls retry 3 times with exponential backoff (5s, 10s, 20s)
+- Failed pages are marked `sync_status = "error"` in the state DB
+- `python cli.py retry-errors` resets errored pages and triggers a full sync
+- Structured logging on Pi; flow run history in Power Automate portal
 
 ---
 
-## 8. Project Structure
+## 8. Risks & Mitigations
+
+| Risk | Impact | Mitigation |
+|------|--------|------------|
+| OneNote doesn't pick up copied .one file | Section creation fails | 45s delay; retry the full create-copy-wait cycle |
+| Timing — section not recognised after copy | Page creation in new section fails | PA retries with longer delay; Pi retries the whole request |
+| Deleting personal notebook section affects Class NB copy | Data loss | Test thoroughly; the copy is independent once complete |
+| OneNote update API is append-only | Can't replace page content cleanly | Delete + recreate for major changes; incremental append otherwise |
+| Notion API rate limit (3 req/sec) | Slow for large databases | Rate limiting, Retry-After, incremental sync |
+| Toggle blocks no OneNote equivalent | Lossy conversion | Flatten to heading + indented content |
+| PA HTTP trigger URL changes if flow is recreated | Sync breaks | Store URL in .env; re-copy if flow is rebuilt |
+
+---
+
+## 9. Dropped from v1 Architecture
+
+| Feature | Reason |
+|---------|--------|
+| Reverse sync (OneNote → Notion) | .one file copy is one-way; detecting granular OneNote changes requires Graph API access (blocked by school tenant) |
+| Conflict resolution | Not needed — Notion is the single source of truth |
+| Flask webhook on Pi | No reverse sync means no inbound webhook needed |
+| Cloudflare Tunnel / ngrok | No inbound traffic to Pi required |
+
+These can be revisited if the school grants app registration access in the future.
+
+---
+
+## 10. Project Structure
 
 ```
 notion-onenote-sync/
-├── sync_engine.py          # Main orchestrator
-├── notion_api.py           # Notion API wrapper
-├── block_converter.py      # Notion blocks ↔ HTML
-├── pa_bridge.py            # Power Automate HTTP client + Flask webhook
+├── sync_engine.py          # Forward-only orchestrator
+├── notion_api.py           # Notion API wrapper + tree builder
+├── block_converter.py      # Notion blocks → OneNote HTML
+├── pa_bridge.py            # Power Automate webhook client + retry
 ├── state_db.py             # SQLite state management
-├── cli.py                  # Click CLI for manual ops
+├── cli.py                  # Click CLI (sync, status, pages, retry-errors, init)
 ├── config.py               # Loads .env, constants
 ├── .env                    # Secrets (gitignored)
-├── sync_state.db           # SQLite database
+├── .env.example            # Template
+├── sync_state.db           # SQLite database (gitignored)
 ├── requirements.txt        # Python deps
 ├── tests/                  # Unit tests
-└── README.md
+│   ├── test_sync_engine.py
+│   ├── test_notion_api.py
+│   ├── test_state_db.py
+│   └── test_block_converter.py
+└── ARCHITECTURE.md         # This file
 ```
 
 ---
 
-## 9. Implementation Plan
+## 11. Implementation Phases
 
 | Phase | Tasks | Estimate |
 |-------|-------|----------|
-| **Phase 1** — Core Forward Sync | Notion client + block converter + state DB + PA Flow 1 + CLI manual trigger | 1–2 days |
-| **Phase 2** — Scheduled Sync | Cron setup, incremental sync (last_edited_time filtering), error handling + retries | 0.5 day |
-| **Phase 3** — Reverse Sync | Flask webhook on Pi + Cloudflare Tunnel + PA Flow 2 + HTML → Notion parser | 1–2 days |
-| **Phase 4** — Conflict Handling | Content hashing, conflict detection, CLI resolution, echo loop prevention | 0.5–1 day |
+| **Phase 1** — Pi Engine | Notion client, block converter, state DB, PA webhook caller, CLI | Done |
+| **Phase 2** — Power Automate Flow | Build the single flow per §4.2, test section creation workaround | 1 day |
+| **Phase 3** — Scheduling | Cron setup, incremental sync, structured logging | 0.5 day |
+| **Phase 4** — Hardening | Test .one copy timing, retry tuning, edge cases | 0.5 day |
 
-> **Recommendation:** Start with Phase 1. Get a single page syncing from Notion to OneNote via Power Automate. Once that pipeline is solid, the other phases build on top of it incrementally. The reverse sync (Phase 3) is the most complex piece and can be deferred.
+> **Recommendation:** Test the .one file copy workaround manually first (Phase 2) to validate timing and confirm that deleting the personal notebook section doesn't affect the Class Notebook copy. Once that's solid, the rest is straightforward.

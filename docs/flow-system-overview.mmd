@@ -1,0 +1,66 @@
+%%{ init: { "theme": "default", "flowchart": { "curve": "basis" } } }%%
+flowchart LR
+    subgraph pi ["<b>Raspberry Pi</b>"]
+        direction TB
+        cron["Cron / CLI trigger"]
+        notion_api["<b>Notion API Client</b><br/>Query database<br/>Fetch blocks"]
+        tree["<b>Tree Builder</b><br/>Parent-child hierarchy<br/>Root → section<br/>Children → pages"]
+        converter["<b>Block Converter</b><br/>Notion blocks → HTML"]
+        webhook["<b>Webhook Caller</b><br/>POST to PA<br/>Retry × 3"]
+        statedb[("State DB<br/>(SQLite)<br/>page mappings<br/>content hashes<br/>section IDs")]
+
+        cron --> notion_api --> tree --> converter --> webhook
+        webhook -. "record result" .-> statedb
+        notion_api -. "check last sync" .-> statedb
+    end
+
+    subgraph notion ["<b>Notion</b>"]
+        db["Database<br/>with pages"]
+    end
+
+    subgraph pa ["<b>Power Automate</b>"]
+        direction TB
+        trigger["HTTP Trigger"]
+        resolve["Section Resolution"]
+        page_op["Create / Update Page"]
+        resp["HTTP Response"]
+
+        trigger --> resolve --> page_op --> resp
+    end
+
+    subgraph onenote ["<b>OneNote Class Notebook</b>"]
+        direction TB
+        sg["Section Group<br/><i>Sean Cassidy - LDE Learner</i>"]
+        sec1["Section: Topic A"]
+        sec2["Section: Topic B"]
+        sg --- sec1
+        sg --- sec2
+    end
+
+    subgraph onedrive ["<b>OneDrive (Personal)</b>"]
+        temp["Temp .one file<br/><i>(created then deleted)</i>"]
+    end
+
+    subgraph sp ["<b>SharePoint</b>"]
+        sp_path["SiteAssets/<br/>Notebook Path"]
+    end
+
+    db -- "poll for changes" --> notion_api
+    webhook -- "POST payload" --> trigger
+    resp -- "page_id, section_id" --> webhook
+    page_op -- "create/update page" --> sg
+    resolve -. "copy .one file" .-> temp
+    temp -. "SharePoint copy" .-> sp_path
+    sp_path -. "OneNote registers" .-> sg
+
+    classDef piStyle fill:#F0F4FF,stroke:#4A90D9
+    classDef notionStyle fill:#FFF8F0,stroke:#E07C24
+    classDef paStyle fill:#F0FFF4,stroke:#28A745
+    classDef onenoteStyle fill:#F5F0FF,stroke:#6940A5
+    classDef storageStyle fill:#FFF5F5,stroke:#CC5555
+
+    class pi piStyle
+    class notion notionStyle
+    class pa paStyle
+    class onenote onenoteStyle
+    class onedrive,sp storageStyle

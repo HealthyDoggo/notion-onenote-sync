@@ -7,14 +7,14 @@ load_dotenv(BASE_DIR / ".env")
 
 NOTION_TOKEN = os.environ.get("NOTION_TOKEN", "")
 NOTION_DATABASE_ID = os.environ.get("NOTION_DATABASE_ID", "")
+NOTION_PARENT_PROPERTY = os.environ.get("NOTION_PARENT_PROPERTY", "Parent")
 PA_FORWARD_WEBHOOK_URL = os.environ.get("PA_FORWARD_WEBHOOK_URL", "")
-PA_REVERSE_WEBHOOK_SECRET = os.environ.get("PA_REVERSE_WEBHOOK_SECRET", "")
-FLASK_PORT = int(os.environ.get("FLASK_PORT", "5123"))
 
 DB_PATH = BASE_DIR / "sync_state.db"
 
 NOTION_API_RATE_LIMIT = 3  # requests per second
-SYNC_CONFLICT_WINDOW_SECONDS = 300  # 5 minutes
+PA_RETRY_ATTEMPTS = 3
+PA_RETRY_BACKOFF_BASE = 5  # seconds; retries at 5s, 10s, 20s
 
 NOTION_COLOURS = {
     "default":           ("#F7F6F3", "#37352F"),

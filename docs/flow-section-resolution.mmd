@@ -1,0 +1,49 @@
+%%{ init: { "theme": "default", "flowchart": { "curve": "basis" } } }%%
+flowchart TD
+    start(["Section Resolution Start"])
+
+    check_id{"onenote_section_id<br/>in payload?"}
+
+    use_provided["Use provided section ID"]
+
+    get_sections["<b>Get sections</b><br/>OneNote Business connector<br/>List all sections in<br/>Class Notebook"]
+
+    filter["<b>Filter array</b><br/>displayName == section_name"]
+
+    found{"Section<br/>found?"}
+
+    use_existing["Use existing section ID"]
+
+    create["<b>Create section</b><br/>in personal OneDrive notebook<br/><i>OneNote Business connector</i>"]
+
+    copy["<b>Copy .one file</b><br/>OneDrive → SharePoint<br/><i>SharePoint connector</i><br/><br/>Source:<br/>Documents/Sean @ LDE UTC/<br/>{section_name}.one<br/><br/>Destination:<br/>/sites/PsychologyKS525-27/<br/>SiteAssets/.../<br/>Sean Cassidy - LDE Learner/<br/>{section_name}.one"]
+
+    wait["<b>Delay 45 seconds</b><br/>Wait for OneNote to<br/>register the .one file"]
+
+    re_get["<b>Get sections</b><br/>Re-query Class Notebook"]
+
+    re_filter["<b>Filter array</b><br/>Find newly created section"]
+
+    use_new["Use new section ID"]
+
+    delete["<b>Delete .one</b><br/>from personal notebook<br/><i>OneDrive connector</i>"]
+
+    done(["var_section_id set<br/>→ proceed to page create/update"])
+
+    start --> check_id
+    check_id -- "YES" --> use_provided --> done
+    check_id -- "NO" --> get_sections --> filter --> found
+    found -- "YES" --> use_existing --> done
+    found -- "NO" --> create --> copy --> wait --> re_get --> re_filter --> use_new --> delete --> done
+
+    classDef startEnd fill:#E8E8E8,stroke:#666,color:#333
+    classDef condition fill:#FFF3CD,stroke:#D4A017,color:#333
+    classDef action fill:#F5F5F5,stroke:#999,color:#333
+    classDef shortcut fill:#D4EDDA,stroke:#28A745,color:#333
+    classDef copy fill:#E3F2FD,stroke:#1565C0,color:#333
+
+    class start,done startEnd
+    class check_id,found condition
+    class get_sections,filter,create,wait,re_get,re_filter,delete action
+    class use_provided,use_existing,use_new shortcut
+    class copy copy

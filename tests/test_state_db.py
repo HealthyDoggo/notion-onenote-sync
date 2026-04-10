@@ -1,8 +1,6 @@
 """Tests for the SQLite state database."""
 
-import tempfile
 from datetime import datetime, timezone
-from pathlib import Path
 
 import pytest
 
@@ -103,3 +101,110 @@ def test_get_last_sync_time(db):
     assert db.get_last_sync_time() is None
     db.upsert_page(notion_page_id="p1", sync_status="synced")
     assert db.get_last_sync_time() is not None
+
+
+# ── Hierarchy column tests ────────────────────────────────────────────────
+
+def test_upsert_with_hierarchy_fields(db):
+    db.upsert_page(
+        notion_page_id="child-1",
+        notion_title="Conformity",
+        sync_status="synced",
+        parent_notion_id="root-1",
+        onenote_section_id=None,
+        page_level=0,
+    )
+    record = db.get_by_notion_id("child-1")
+    assert record["parent_notion_id"] == "root-1"
+    assert record["page_level"] == 0
+
+
+def test_upsert_root_with_section_id(db):
+    db.upsert_page(
+        notion_page_id="root-1",
+        notion_title="Social Influence",
+        sync_status="synced",
+        onenote_section_id="sec-abc",
+        page_level=-1,
+    )
+    record = db.get_by_notion_id("root-1")
+    assert record["onenote_section_id"] == "sec-abc"
+    assert record["page_level"] == -1
+
+
+def test_get_children(db):
+    db.upsert_page(notion_page_id="root", notion_title="Topic", sync_status="synced")
+    db.upsert_page(notion_page_id="c1", notion_title="A Child", sync_status="synced", parent_notion_id="root")
+    db.upsert_page(notion_page_id="c2", notion_title="B Child", sync_status="synced", parent_notion_id="root")
+    db.upsert_page(notion_page_id="other", notion_title="Unrelated", sync_status="synced", parent_notion_id="other-root")
+
+    children = db.get_children("root")
+    assert len(children) == 2
+    assert children[0]["notion_page_id"] == "c1"
+    assert children[1]["notion_page_id"] == "c2"
+
+
+def test_get_children_empty(db):
+    db.upsert_page(notion_page_id="root", notion_title="Topic", sync_status="synced")
+    assert db.get_children("root") == []
+
+
+def test_get_section_id_for_page_direct(db):
+    db.upsert_page(notion_page_id="root", onenote_section_id="sec-1", sync_status="synced")
+    assert db.get_section_id_for_page("root") == "sec-1"
+
+
+def test_get_section_id_for_page_via_parent(db):
+    db.upsert_page(notion_page_id="root", onenote_section_id="sec-1", sync_status="synced")
+    db.upsert_page(notion_page_id="child", parent_notion_id="root", sync_status="synced")
+    db.upsert_page(notion_page_id="grandchild", parent_notion_id="child", sync_status="synced")
+    assert db.get_section_id_for_page("grandchild") == "sec-1"
+
+
+def test_get_section_id_for_page_not_found(db):
+    db.upsert_page(notion_page_id="orphan", sync_status="synced")
+    assert db.get_section_id_for_page("orphan") is None
+
+
+# ── Migration test ────────────────────────────────────────────────────────
+
+def test_migration_adds_columns(tmp_path):
+    """Opening a DB created without hierarchy columns should auto-migrate."""
+    import sqlite3
+    db_path = tmp_path / "old.db"
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("""
+        CREATE TABLE page_sync (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            notion_page_id  TEXT UNIQUE NOT NULL,
+            onenote_page_id TEXT,
+            notion_title    TEXT,
+            last_notion_edit  DATETIME,
+            last_onenote_edit DATETIME,
+            last_synced       DATETIME,
+            content_hash      TEXT,
+            last_source       TEXT,
+            sync_status       TEXT DEFAULT 'pending',
+            conversion_notes  TEXT
+        )
+    """)
+    conn.execute("INSERT INTO page_sync (notion_page_id, sync_status) VALUES ('old-page', 'synced')")
+    conn.commit()
+    conn.close()
+
+    db = SyncStateDB(db_path=db_path)
+    record = db.get_by_notion_id("old-page")
+    assert record is not None
+    assert record["parent_notion_id"] is None
+    assert record["onenote_section_id"] is None
+
+    db.upsert_page(
+        notion_page_id="old-page",
+        parent_notion_id="some-parent",
+        onenote_section_id="sec-1",
+        page_level=0,
+    )
+    record = db.get_by_notion_id("old-page")
+    assert record["parent_notion_id"] == "some-parent"
+    assert record["onenote_section_id"] == "sec-1"
+    assert record["page_level"] == 0

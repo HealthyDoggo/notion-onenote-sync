@@ -17,6 +17,23 @@ def _connect(db_path: Optional[Path] = None) -> sqlite3.Connection:
     return conn
 
 
+_MIGRATION_COLUMNS = [
+    ("parent_notion_id", "TEXT"),
+    ("onenote_section_id", "TEXT"),
+    ("page_level", "INTEGER DEFAULT -1"),
+]
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """Add columns introduced after the initial schema."""
+    cursor = conn.execute("PRAGMA table_info(page_sync)")
+    existing = {row[1] for row in cursor.fetchall()}
+    for col_name, col_type in _MIGRATION_COLUMNS:
+        if col_name not in existing:
+            conn.execute(f"ALTER TABLE page_sync ADD COLUMN {col_name} {col_type}")
+    conn.commit()
+
+
 def init_db(db_path: Optional[Path] = None) -> None:
     conn = _connect(db_path)
     conn.execute("""
@@ -32,9 +49,13 @@ def init_db(db_path: Optional[Path] = None) -> None:
             last_source       TEXT CHECK(last_source IN ('notion', 'onenote')),
             sync_status       TEXT DEFAULT 'pending'
                               CHECK(sync_status IN ('synced', 'pending', 'conflict', 'error')),
-            conversion_notes  TEXT
+            conversion_notes  TEXT,
+            parent_notion_id  TEXT,
+            onenote_section_id TEXT,
+            page_level        INTEGER DEFAULT -1
         )
     """)
+    _migrate(conn)
     conn.commit()
     conn.close()
 
@@ -59,6 +80,9 @@ class SyncStateDB:
         last_source: Optional[str] = None,
         sync_status: str = "pending",
         conversion_notes: Optional[str] = None,
+        parent_notion_id: Optional[str] = None,
+        onenote_section_id: Optional[str] = None,
+        page_level: Optional[int] = None,
     ) -> None:
         conn = self._conn()
         now = datetime.now(timezone.utc).isoformat()
@@ -67,18 +91,22 @@ class SyncStateDB:
             INSERT INTO page_sync (
                 notion_page_id, onenote_page_id, notion_title,
                 last_notion_edit, last_onenote_edit, last_synced,
-                content_hash, last_source, sync_status, conversion_notes
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                content_hash, last_source, sync_status, conversion_notes,
+                parent_notion_id, onenote_section_id, page_level
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(notion_page_id) DO UPDATE SET
-                onenote_page_id  = COALESCE(excluded.onenote_page_id, page_sync.onenote_page_id),
-                notion_title     = COALESCE(excluded.notion_title, page_sync.notion_title),
-                last_notion_edit = COALESCE(excluded.last_notion_edit, page_sync.last_notion_edit),
-                last_onenote_edit= COALESCE(excluded.last_onenote_edit, page_sync.last_onenote_edit),
-                last_synced      = excluded.last_synced,
-                content_hash     = COALESCE(excluded.content_hash, page_sync.content_hash),
-                last_source      = COALESCE(excluded.last_source, page_sync.last_source),
-                sync_status      = excluded.sync_status,
-                conversion_notes = COALESCE(excluded.conversion_notes, page_sync.conversion_notes)
+                onenote_page_id   = COALESCE(excluded.onenote_page_id, page_sync.onenote_page_id),
+                notion_title      = COALESCE(excluded.notion_title, page_sync.notion_title),
+                last_notion_edit  = COALESCE(excluded.last_notion_edit, page_sync.last_notion_edit),
+                last_onenote_edit = COALESCE(excluded.last_onenote_edit, page_sync.last_onenote_edit),
+                last_synced       = excluded.last_synced,
+                content_hash      = COALESCE(excluded.content_hash, page_sync.content_hash),
+                last_source       = COALESCE(excluded.last_source, page_sync.last_source),
+                sync_status       = excluded.sync_status,
+                conversion_notes  = COALESCE(excluded.conversion_notes, page_sync.conversion_notes),
+                parent_notion_id  = COALESCE(excluded.parent_notion_id, page_sync.parent_notion_id),
+                onenote_section_id= COALESCE(excluded.onenote_section_id, page_sync.onenote_section_id),
+                page_level        = COALESCE(excluded.page_level, page_sync.page_level)
             """,
             (
                 notion_page_id, onenote_page_id, notion_title,
@@ -86,6 +114,7 @@ class SyncStateDB:
                 last_onenote_edit.isoformat() if last_onenote_edit else None,
                 now,
                 content_hash, last_source, sync_status, conversion_notes,
+                parent_notion_id, onenote_section_id, page_level,
             ),
         )
         conn.commit()
@@ -108,6 +137,35 @@ class SyncStateDB:
         ).fetchone()
         conn.close()
         return dict(row) if row else None
+
+    def get_children(self, parent_notion_id: str) -> list[dict]:
+        conn = self._conn()
+        rows = conn.execute(
+            "SELECT * FROM page_sync WHERE parent_notion_id = ? ORDER BY notion_title",
+            (parent_notion_id,),
+        ).fetchall()
+        conn.close()
+        return [dict(r) for r in rows]
+
+    def get_section_id_for_page(self, notion_page_id: str) -> Optional[str]:
+        """Walk up the parent chain to find the OneNote section ID for a page."""
+        conn = self._conn()
+        current_id = notion_page_id
+        for _ in range(10):  # guard against cycles
+            row = conn.execute(
+                "SELECT parent_notion_id, onenote_section_id FROM page_sync WHERE notion_page_id = ?",
+                (current_id,),
+            ).fetchone()
+            if not row:
+                break
+            if row["onenote_section_id"]:
+                conn.close()
+                return row["onenote_section_id"]
+            if not row["parent_notion_id"]:
+                break
+            current_id = row["parent_notion_id"]
+        conn.close()
+        return None
 
     def get_all(self) -> list[dict]:
         conn = self._conn()

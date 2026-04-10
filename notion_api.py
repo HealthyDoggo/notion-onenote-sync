@@ -138,6 +138,49 @@ class NotionSync:
                     children=batch,
                 )
 
+    def get_parent_id(self, page: dict) -> Optional[str]:
+        """Extract the parent page ID from the configured relation property."""
+        prop = page.get("properties", {}).get(config.NOTION_PARENT_PROPERTY)
+        if not prop or prop.get("type") != "relation":
+            return None
+        relations = prop.get("relation", [])
+        if relations:
+            return relations[0].get("id")
+        return None
+
+    def build_page_tree(self, pages: list[dict]) -> list[dict]:
+        """Build a tree from a flat list of database pages using the parent relation.
+
+        Each node gets:
+            _children: list of child page dicts
+            _depth: 0 for roots, 1 for children, etc.
+            _parent_id: the Notion page ID of the parent (None for roots)
+
+        Returns only root nodes (those with no parent).
+        """
+        by_id = {p["id"]: p for p in pages}
+        for p in pages:
+            p["_children"] = []
+            p["_parent_id"] = self.get_parent_id(p)
+
+        roots = []
+        for p in pages:
+            parent_id = p["_parent_id"]
+            if parent_id and parent_id in by_id:
+                by_id[parent_id]["_children"].append(p)
+            else:
+                roots.append(p)
+
+        def _set_depth(node, depth):
+            node["_depth"] = depth
+            for child in node["_children"]:
+                _set_depth(child, depth + 1)
+
+        for root in roots:
+            _set_depth(root, 0)
+
+        return roots
+
     def get_last_edited_time(self, page: dict) -> datetime:
         ts = page.get("last_edited_time", "")
         return datetime.fromisoformat(ts.replace("Z", "+00:00"))
