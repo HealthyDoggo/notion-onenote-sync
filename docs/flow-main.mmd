@@ -1,69 +1,136 @@
 %%{ init: { "theme": "default", "flowchart": { "curve": "basis" } } }%%
 flowchart TD
-    trigger["<b>When an HTTP request is received</b><br/><i>POST from Pi webhook caller</i><br/>section_name, page_title, html_body,<br/>notion_page_id, action, onenote_page_id,<br/>onenote_section_id, page_level"]
+    trigger["<b>When an HTTP request is received</b><br/><i>POST from Pi webhook caller</i><br/><br/><b>Payload fields:</b><br/>action: create | read | replace<br/>section_name: string <i>(Notion root topic title)</i><br/>section_group_path: string[] <i>folder names outer→inner</i><br/>page_title: string<br/>html_body: string<br/>notion_page_id: string<br/>onenote_page_id: string | null<br/>onenote_section_id: string | null <i>(cached section Key)</i><br/>use_flat_section: bool <i>(leaf is SectionName.one, not folder + Main.one)</i>"]
 
-    init_vars["<b>Initialize variables</b><br/>var_section_id = onenote_section_id<br/>var_onenote_page_id = onenote_page_id"]
+    init_vars["<b>Initialize variables</b><br/>var_section_id = payload.onenote_section_id<br/>var_onenote_page_id = payload.onenote_page_id"]
 
+    cond_action{"action?"}
+
+    %% ── READ branch ──
+    subgraph read_block ["<b>Read Page (for merge)</b>"]
+        read_page["<b>Get page content</b><br/><i>OneNote Business connector</i><br/>Section: var_section_id<br/>Page: payload.onenote_page_id"]
+        read_response["<b>Response</b> (HTTP 200)<br/>{ current_html: string,<br/>  onenote_section_id: string }"]
+        read_page --> read_response
+    end
+
+    %% ── Section resolution ──
     cond_section{"Is var_section_id<br/>empty?"}
 
-    get_sections["<b>Get sections in notebook</b><br/><i>OneNote Business connector</i><br/>Notebook: Class Notebook"]
-
-    filter_sections["<b>Filter array</b><br/>displayName == section_name"]
-
-    cond_exists{"Filter result<br/>length > 0?"}
-
-    set_existing["<b>Set var_section_id</b><br/>= first(filter)?['id']"]
-
-    subgraph one_copy ["<b>.one File Copy Workaround</b>"]
+    subgraph folder_model ["<b>Resolve section groups + leaf section</b><br/><i>Walk section_group_path as SharePoint folders then resolve leaf .one file</i><br/><i>Flat: walk path[0..n-2] as folders, leaf = path[n-1].one</i><br/><i>Grouped: walk path[0..n-1] as folders, leaf = path[last]/Main.one</i>"]
         direction TB
-        create_personal["<b>Create section</b><br/><i>OneNote Business connector</i><br/>Personal OneDrive notebook<br/>Name: section_name"]
 
-        copy_file["<b>Copy file</b><br/><i>SharePoint connector</i><br/>Source: OneDrive/.../section_name.one<br/>Dest: Class NB SharePoint path"]
+        parse["<b>Initialize</b><br/>var_current_path = base folder<br/><i>/SiteAssets/Psychology KS5 25-27 Notebook/Sean Cassidy - LDE Learner/</i>"]
 
-        delay["<b>Delay</b><br/>45 seconds"]
+        get_folder["<b>Get folder metadata</b><br/><i>SharePoint connector</i><br/>Path: var_current_path + current segment"]
 
-        get_sections2["<b>Get sections in notebook</b><br/><i>OneNote Business connector</i><br/>Notebook: Class Notebook"]
+        cond_sg{"Folder<br/>exists?"}
 
-        filter2["<b>Filter array</b><br/>displayName == section_name"]
+        create_folder["<b>Create new folder</b><br/><i>SharePoint connector</i><br/>Parent: var_current_path<br/>Name: current segment"]
 
-        set_new["<b>Set var_section_id</b><br/>= first(filter)?['id']"]
+        advance_path["<b>var_current_path += segment + /</b><br/><i>Repeat for next segment<br/>Flat: stop before last segment<br/>Grouped: stop after last segment</i>"]
 
-        cleanup["<b>Delete file</b><br/><i>OneDrive connector</i><br/>Remove .one from personal NB"]
+        cond_flat_mode{"payload.<br/>use_flat_section?"}
 
+        check_leaf_flat["<b>Get file metadata</b><br/><i>SharePoint connector</i><br/>Path: var_current_path + path[last] + .one<br/><i>e.g. .../Biopsychology/Neurons.one</i>"]
+
+        cond_leaf_exists{"Flat .one<br/>exists?"}
+
+        check_sec_folder["<b>Get folder metadata</b><br/><i>SharePoint connector</i><br/>Path: var_current_path + path[last] + /"]
+
+        cond_sec_folder{"Section folder<br/>exists?"}
+
+        create_sec_folder["<b>Create new folder</b><br/><i>SharePoint connector</i><br/>Parent: var_current_path<br/>Name: path[last]"]
+
+        check_main["<b>Get file metadata</b><br/><i>SharePoint connector</i><br/>Path: var_current_path + path[last] + /Main.one<br/><i>e.g. .../Biopsychology/Neurons/Main.one</i>"]
+
+        cond_main_exists{"Main.one<br/>exists?"}
+
+        get_sections_nb["<b>Get sections in notebook</b><br/><i>OneNote Business connector</i><br/>Notebook: Class Notebook<br/><i>1-af3a0c0f-09c4-469a-bcbd-63668f2d4fc4</i>"]
+
+        filter_sec_pa["<b>Filter array</b><br/>From: Get_sections result<br/><b>Flat:</b> name = var_leaf_name<br/>AND parentSectionGroup/name = last segment of var_loop_path<br/><b>Grouped:</b> name = 'Main'<br/>AND parentSectionGroup/name = var_leaf_name"]
+
+        set_var["<b>Set var_section_id</b><br/>= Filter_sec first result id<br/><i>section Key for create / read / replace</i>"]
+
+        parse --> get_folder --> cond_sg
+        cond_sg -- "YES" --> advance_path
+        cond_sg -- "NO" --> create_folder --> advance_path
+        advance_path --> cond_flat_mode
+        cond_flat_mode -- "YES (flat)" --> check_leaf_flat --> cond_leaf_exists
+        cond_flat_mode -- "NO (grouped)" --> check_sec_folder --> cond_sec_folder
+        cond_sec_folder -- "YES" --> check_main
+        cond_sec_folder -- "NO" --> create_sec_folder --> check_main
+        check_main --> cond_main_exists
+        cond_leaf_exists -- "YES" --> get_sections_nb
+        cond_main_exists -- "YES" --> get_sections_nb
+        get_sections_nb --> filter_sec_pa --> set_var
+    end
+
+    subgraph one_copy ["<b>.one File Copy Workaround</b><br/><i>leaf section not found — create in personal NB and copy</i>"]
+        direction TB
+        create_personal["<b>Create section</b><br/>Personal OneDrive notebook<br/><i>Name: path[last] (flat) or Main (grouped)</i>"]
+        copy_file["<b>Copy .one file</b><br/>OneDrive → SharePoint<br/><i>Flat: var_current_path + path[last].one</i><br/><i>Grouped: var_current_path + path[last]/Main.one</i>"]
+        delay["<b>Delay 45s</b>"]
+        get_sections2["<b>Get sections in notebook</b><br/><i>OneNote Business connector</i>"]
+        filter2["<b>Filter array</b><br/>displayName = path[last] or Main"]
+        set_new["<b>Set var_section_id</b>"]
+        cleanup["<b>Delete section from personal NB</b>"]
         create_personal --> copy_file --> delay --> get_sections2 --> filter2 --> set_new --> cleanup
     end
 
-    cond_action{"action ==<br/>'create'?"}
+    cond_leaf_exists -- "NO" --> one_copy
+    cond_main_exists -- "NO" --> one_copy
 
+    cond_sec_ok{"Section<br/>resolved?"}
+    set_var --> cond_sec_ok
+    cleanup --> cond_sec_ok
+    cond_sec_ok -- "NO" --> one_copy
+    cond_sec_ok -- "YES" --> route_action
+
+    %% ── CREATE branch ──
     subgraph create_block ["<b>Create Page</b>"]
-        create_page["<b>Create page in a section</b><br/><i>OneNote Business connector</i><br/>Section: var_section_id<br/>Content: html_body"]
+        create_page["<b>Create page in section</b><br/><i>OneNote Business connector</i><br/>Section: var_section_id<br/>Title: payload.page_title<br/>Content: payload.html_body<br/>Page level: payload.page_level"]
         set_page_id["<b>Set var_onenote_page_id</b><br/>= new page ID"]
         create_page --> set_page_id
     end
 
-    subgraph update_block ["<b>Update Page</b>"]
-        update_page["<b>Update page content</b><br/><i>OneNote Business connector</i><br/>Page: var_onenote_page_id<br/>Content: append html_body"]
+    %% ── REPLACE branch ──
+    subgraph replace_block ["<b>Replace Page (delete + create)</b>"]
+        direction TB
+        delete_old["<b>Delete old page</b><br/><i>if connector supports it</i><br/>Page: payload.onenote_page_id"]
+        create_new["<b>Create page in section</b><br/><i>OneNote Business connector</i><br/>Section: var_section_id<br/>Title: payload.page_title<br/>Content: payload.html_body (merged)<br/>Page level: payload.page_level"]
+        set_new_id["<b>Set var_onenote_page_id</b><br/>= new page ID"]
+        delete_old --> create_new --> set_new_id
     end
 
-    response["<b>Response</b> (HTTP 200)<br/>{<br/>  onenote_page_id: var_onenote_page_id,<br/>  onenote_section_id: var_section_id,<br/>  status: 'success'<br/>}"]
+    response["<b>Response</b> (HTTP 200)<br/>{<br/>  onenote_page_id: string,<br/>  onenote_section_id: string,<br/>  status: 'success'<br/>}"]
 
-    trigger --> init_vars --> cond_section
-    cond_section -- "YES (empty)" --> get_sections
-    cond_section -- "NO (provided)" --> cond_action
-    get_sections --> filter_sections --> cond_exists
-    cond_exists -- "YES (found)" --> set_existing --> cond_action
-    cond_exists -- "NO (not found)" --> one_copy --> cond_action
-    cond_action -- "create" --> create_block --> response
-    cond_action -- "update" --> update_block --> response
+    trigger --> init_vars --> cond_action
+    cond_action -- "create" --> cond_section
+    cond_action -- "replace" --> cond_section
+    cond_action -- "read" --> cond_section
+
+    cond_section -- "YES (empty)" --> parse
+    cond_section -- "NO (cached id)" --> route_action
+
+    route_action{"action?"}
+    route_action -- "create" --> create_block --> response
+    route_action -- "replace" --> replace_block --> response
+    route_action -- "read" --> read_block
+
+    read_block --> response
 
     classDef trigger fill:#4A90D9,stroke:#2C5F8A,color:#fff
     classDef action fill:#F5F5F5,stroke:#999,color:#333
     classDef condition fill:#FFF3CD,stroke:#D4A017,color:#333
-    classDef subgraphStyle fill:#FFF0F0,stroke:#CC5555
     classDef response fill:#D4EDDA,stroke:#28A745,color:#333
+    classDef read fill:#E3F2FD,stroke:#1565C0,color:#333
+    classDef folder fill:#EDE7F6,stroke:#5E35B1,color:#333
 
     class trigger trigger
-    class init_vars,get_sections,filter_sections,set_existing,create_page,set_page_id,update_page action
-    class create_personal,copy_file,delay,get_sections2,filter2,set_new,cleanup action
-    class cond_section,cond_exists,cond_action condition
-    class response response
+    class init_vars,create_personal,copy_file,delay,get_sections2,filter2,set_new,cleanup action
+    class create_page,set_page_id,delete_old,create_new,set_new_id action
+    class read_page read
+    class cond_action,cond_section,cond_sec_ok,route_action condition
+    class response,read_response response
+    class parse,get_folder,create_folder,advance_path,check_leaf_flat,check_sec_folder,create_sec_folder,check_main,get_sections_nb,filter_sec_pa,set_var folder
+    class cond_sg,cond_flat_mode,cond_leaf_exists,cond_sec_folder,cond_main_exists condition

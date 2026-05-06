@@ -1,0 +1,51 @@
+%%{ init: { "theme": "default", "flowchart": { "curve": "basis" } } }%%
+flowchart TD
+    start(["Pi detects content hash changed<br/>for an existing page"])
+
+    step1["<b>Step 1: Read current page</b><br/>Pi calls PA with:<br/>{<br/>  action: 'read',<br/>  onenote_page_id: string,<br/>  onenote_section_id: string | null<br/>}"]
+
+    pa_read["<b>Power Automate</b><br/>Get page content<br/><i>OneNote Business connector</i><br/>Section: payload.onenote_section_id<br/>Page: payload.onenote_page_id"]
+
+    return_html["PA returns:<br/>{<br/>  current_html: string,<br/>  onenote_section_id: string<br/>}"]
+
+    step2["<b>Step 2: Merge on Pi</b><br/>html_merge.merge_html(<br/>  fresh_notion_html,<br/>  current_onenote_html<br/>)"]
+
+    subgraph merge_logic ["<b>Merge Algorithm</b>"]
+        direction TB
+        classify["Classify each element:<br/><b>Fingerprinted</b> = synced from Notion<br/><b>No fingerprint</b> = teacher addition<br/><b>Red text</b> = teacher feedback"]
+        build_map["Build insertion map:<br/>teacher content indexed by<br/>position between synced elements"]
+        apply["Fresh Notion HTML +<br/>teacher content re-inserted<br/>at original relative positions"]
+        classify --> build_map --> apply
+    end
+
+    step3["<b>Step 3: Replace page</b><br/>Pi calls PA with:<br/>{<br/>  action: 'replace',<br/>  section_name: string,<br/>  section_group_path: string[],<br/>  page_title: string,<br/>  html_body: string (merged),<br/>  notion_page_id: string,<br/>  onenote_page_id: string,<br/>  onenote_section_id: string | null,<br/>  page_level: int (0…PAGE_LEVEL_MAX)<br/>}"]
+
+    pa_replace["<b>Power Automate</b><br/>Delete old page (if possible)<br/>Create new page with merged HTML<br/><i>OneNote Business connector</i>"]
+
+    return_id["PA returns:<br/>{<br/>  onenote_page_id: string,<br/>  onenote_section_id: string,<br/>  status: 'success'<br/>}"]
+
+    update_db["<b>Update state DB</b><br/>new page ID, content hash"]
+
+    done(["Sync complete — teacher<br/>feedback preserved"])
+
+    start --> step1 --> pa_read --> return_html --> step2
+    step2 --> merge_logic --> step3 --> pa_replace --> return_id --> update_db --> done
+
+    subgraph legend ["<b>Fingerprint Detection</b>"]
+        direction LR
+        fp["Elements with<br/><code>letter-spacing:0.01pt</code><br/>= From Notion (replace)"]
+        no_fp["Elements without fingerprint<br/>= Teacher added (preserve)"]
+        red["Red text<br/><code>color:red / #ff0000</code><br/>= Teacher feedback (always keep)"]
+    end
+
+    classDef startEnd fill:#E8E8E8,stroke:#666,color:#333
+    classDef piStep fill:#F0F4FF,stroke:#4A90D9,color:#333
+    classDef paStep fill:#F0FFF4,stroke:#28A745,color:#333
+    classDef mergeStep fill:#FFF5F5,stroke:#CC5555,color:#333
+    classDef legendBox fill:#FFFFF0,stroke:#999,color:#333
+
+    class start,done startEnd
+    class step1,step2,step3,update_db piStep
+    class pa_read,pa_replace,return_html,return_id paStep
+    class classify,build_map,apply mergeStep
+    class fp,no_fp,red legendBox

@@ -5,11 +5,14 @@ flowchart LR
         cron["Cron / CLI trigger"]
         notion_api["<b>Notion API Client</b><br/>Query database<br/>Fetch blocks"]
         tree["<b>Tree Builder</b><br/>Parent-child hierarchy<br/>Root → section<br/>Children → pages"]
-        converter["<b>Block Converter</b><br/>Notion blocks → HTML"]
+        converter["<b>Block Converter</b><br/>Notion blocks → HTML<br/><i>with fingerprint style</i>"]
+        merger["<b>HTML Merge</b><br/>Preserve teacher feedback<br/>Fingerprint + red text detection"]
         webhook["<b>Webhook Caller</b><br/>POST to PA<br/>Retry × 3"]
         statedb[("State DB<br/>(SQLite)<br/>page mappings<br/>content hashes<br/>section IDs")]
 
-        cron --> notion_api --> tree --> converter --> webhook
+        cron --> notion_api --> tree --> converter
+        converter -- "new page" --> webhook
+        converter -- "update: read → merge → replace" --> merger --> webhook
         webhook -. "record result" .-> statedb
         notion_api -. "check last sync" .-> statedb
     end
@@ -22,10 +25,10 @@ flowchart LR
         direction TB
         trigger["HTTP Trigger"]
         resolve["Section Resolution"]
-        page_op["Create / Update Page"]
+        actions["Create / Read / Replace"]
         resp["HTTP Response"]
 
-        trigger --> resolve --> page_op --> resp
+        trigger --> resolve --> actions --> resp
     end
 
     subgraph onenote ["<b>OneNote Class Notebook</b>"]
@@ -46,9 +49,9 @@ flowchart LR
     end
 
     db -- "poll for changes" --> notion_api
-    webhook -- "POST payload" --> trigger
-    resp -- "page_id, section_id" --> webhook
-    page_op -- "create/update page" --> sg
+    webhook -- "POST {<br/>action, section_name,<br/>section_group_path[],<br/>page_title, html_body,<br/>notion_page_id,<br/>onenote_page_id,<br/>onenote_section_id,<br/>page_level<br/>}" --> trigger
+    resp -- "{<br/>onenote_page_id,<br/>onenote_section_id,<br/>status<br/>} or { current_html,<br/>onenote_section_id }" --> webhook
+    actions -- "create/read/replace" --> sg
     resolve -. "copy .one file" .-> temp
     temp -. "SharePoint copy" .-> sp_path
     sp_path -. "OneNote registers" .-> sg

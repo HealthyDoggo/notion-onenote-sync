@@ -77,14 +77,14 @@ class TestBlocksToHtml:
     def test_paragraph(self):
         blocks = [{"type": "paragraph", "paragraph": {"rich_text": [_rt("Hello world")]}}]
         html = blocks_to_html(blocks)
-        assert "<p>Hello world</p>" in html
+        assert "Hello world</p>" in html
 
     def test_headings(self):
         for level in (1, 2, 3):
             block_type = f"heading_{level}"
             blocks = [{"type": block_type, block_type: {"rich_text": [_rt(f"H{level}")]}}]
             html = blocks_to_html(blocks)
-            assert f"<h{level}>H{level}</h{level}>" in html
+            assert f">H{level}</h{level}>" in html
 
     def test_bulleted_list_grouped(self):
         blocks = [
@@ -124,12 +124,12 @@ class TestBlocksToHtml:
     def test_quote(self):
         blocks = [{"type": "quote", "quote": {"rich_text": [_rt("A quote")]}}]
         html = blocks_to_html(blocks)
-        assert "<blockquote>A quote</blockquote>" in html
+        assert ">A quote</blockquote>" in html
 
     def test_divider(self):
         blocks = [{"type": "divider", "divider": {}}]
         html = blocks_to_html(blocks)
-        assert "<hr />" in html
+        assert "<hr " in html and "/>" in html
 
     def test_image(self):
         blocks = [{
@@ -141,7 +141,7 @@ class TestBlocksToHtml:
             },
         }]
         html = blocks_to_html(blocks)
-        assert '<img src="https://img.example.com/photo.jpg"' in html
+        assert 'src="https://img.example.com/photo.jpg"' in html
 
     def test_callout_basic(self):
         blocks = [{
@@ -313,5 +313,5 @@ class TestPageToHtml:
         blocks = [{"type": "paragraph", "paragraph": {"rich_text": [_rt("Content")]}}]
         html = page_to_html("My Title", blocks)
         assert "<title>My Title</title>" in html
-        assert "<p>Content</p>" in html
+        assert "Content</p>" in html
         assert "<!DOCTYPE html>" in html

@@ -7,12 +7,15 @@ Reverse:  OneNote HTML string → Notion block list (for Notion API)
 import hashlib
 import math
 import re
+from datetime import datetime, timezone
 from html import escape
 from typing import Optional
 
 from bs4 import BeautifulSoup, Tag
 
-from config import MAX_CALLOUT_NESTING_DEPTH, NOTION_COLOURS
+from config import MAX_CALLOUT_NESTING_DEPTH, NOTION_COLOURS, ONENOTE_PAGE_WIDTH_PX, SYNC_FINGERPRINT_STYLE
+
+_FP = SYNC_FINGERPRINT_STYLE
 
 # ── Colour reverse-mapping (hex bg → Notion colour key) ───────────────────────
 
@@ -47,7 +50,7 @@ def rich_text_to_html(rich_texts: list[dict]) -> str:
     """Convert Notion rich_text array to inline HTML."""
     parts: list[str] = []
     for rt in rich_texts:
-        text = escape(rt.get("plain_text", ""))
+        text = escape(rt.get("plain_text", "")).replace("\n", "<br/>")
         ann = rt.get("annotations", {})
         href = rt.get("href") or (rt.get("text", {}).get("link") or {}).get("url")
 
@@ -64,6 +67,8 @@ def rich_text_to_html(rich_texts: list[dict]) -> str:
 
         color = ann.get("color", "default")
         if color and color != "default":
+            if color == "red":
+                color = "#C23B22"
             text = f'<span style="color:{color}">{text}</span>'
 
         if href:
@@ -84,46 +89,37 @@ def _get_icon_html(icon: Optional[dict]) -> str:
     return "💡"
 
 
-def _callout_to_html(block: dict, depth: int = 0) -> str:
+def _callout_to_html(block: dict, depth: int = 0, width_px: int = ONENOTE_PAGE_WIDTH_PX) -> str:
     callout = block["callout"]
     icon = _get_icon_html(callout.get("icon"))
     color_key = callout.get("color", "default")
     bg_color, accent_color = NOTION_COLOURS.get(color_key, NOTION_COLOURS["default"])
     rich_text_html = rich_text_to_html(callout.get("rich_text", []))
 
+    inner_width = width_px - 27
     children_html = ""
     children = callout.get("children") or block.get("children", [])
     if children:
-        if depth >= MAX_CALLOUT_NESTING_DEPTH:
-            # Flatten deeply nested callouts into indented paragraphs
-            for child in children:
-                children_html += _block_to_html_inner(child, depth + 1)
-        else:
-            for child in children:
-                children_html += _block_to_html_inner(child, depth + 1)
+        for child in children:
+            children_html += _block_to_html_inner(child, depth + 1, width_px=inner_width)
 
-    icon_attr = escape(icon) if not icon.startswith("<") else escape(icon)
     margin = 4 if depth > 0 else 8
 
     return (
         f'<table data-notion-type="callout" data-notion-color="{escape(color_key)}"'
-        f' style="border-collapse:collapse;width:100%;margin:{margin}px 0;">'
+        f' style="{_FP};table-layout:fixed;border-collapse:collapse;'
+        f'width:{width_px}px;margin:{margin}px 0;">'
         f"<tr>"
-        f'<td data-notion-icon="{icon_attr}" style="'
-        f"width:28px;vertical-align:top;padding:8px 4px 8px 8px;"
-        f"background:{bg_color};"
-        f"border-left:3px solid {accent_color};"
-        f"border-top:1px solid {bg_color};"
-        f'border-bottom:1px solid {bg_color};font-size:18px;">'
-        f"{icon}"
-        f"</td>"
         f'<td style="'
         f"vertical-align:top;padding:8px 12px;"
         f"background:{bg_color};"
-        f"border-right:1px solid {bg_color};"
+        f"border-left:3px solid {accent_color};"
         f"border-top:1px solid {bg_color};"
+        f"border-right:1px solid {bg_color};"
         f'border-bottom:1px solid {bg_color};">'
-        f'<p style="margin:0 0 4px 0;">{rich_text_html}</p>'
+        f'<p style="margin:0 0 4px 0;">'
+        f'<span style="font-size:18px;margin-right:6px;">{icon}</span>'
+        f"{rich_text_html}</p>"
         f"{children_html}"
         f"</td>"
         f"</tr>"
@@ -148,7 +144,7 @@ def _list_items_to_html(blocks: list[dict], start_idx: int, list_type: str) -> t
     return f"<{tag}>{''.join(items)}</{tag}>", i
 
 
-def _block_to_html_inner(block: dict, depth: int = 0) -> str:
+def _block_to_html_inner(block: dict, depth: int = 0, width_px: int = ONENOTE_PAGE_WIDTH_PX) -> str:
     """Convert a single Notion block to HTML. Used internally for recursion."""
     btype = block.get("type", "")
 
@@ -157,53 +153,53 @@ def _block_to_html_inner(block: dict, depth: int = 0) -> str:
         children_html = ""
         children = block["paragraph"].get("children") or block.get("children", [])
         if children:
-            children_html = blocks_to_html(children)
-        return f"<p>{text}</p>{children_html}" if text else f"<p>&nbsp;</p>{children_html}"
+            children_html = blocks_to_html(children, width_px=width_px)
+        return f'<p style="{_FP}">{text}</p>{children_html}' if text else f'<p style="{_FP}">&nbsp;</p>{children_html}'
 
     if btype in ("heading_1", "heading_2", "heading_3"):
         level = btype[-1]
         text = rich_text_to_html(block[btype].get("rich_text", []))
-        return f"<h{level}>{text}</h{level}>"
+        return f'<h{level} style="{_FP}">{text}</h{level}>'
 
     if btype == "bulleted_list_item":
         text = rich_text_to_html(block[btype].get("rich_text", []))
         children_html = ""
         children = block[btype].get("children") or block.get("children", [])
         if children:
-            children_html = blocks_to_html(children)
-        return f"<ul><li>{text}{children_html}</li></ul>"
+            children_html = blocks_to_html(children, width_px=width_px)
+        return f'<ul style="{_FP}"><li>{text}{children_html}</li></ul>'
 
     if btype == "numbered_list_item":
         text = rich_text_to_html(block[btype].get("rich_text", []))
         children_html = ""
         children = block[btype].get("children") or block.get("children", [])
         if children:
-            children_html = blocks_to_html(children)
-        return f"<ol><li>{text}{children_html}</li></ol>"
+            children_html = blocks_to_html(children, width_px=width_px)
+        return f'<ol style="{_FP}"><li>{text}{children_html}</li></ol>'
 
     if btype == "to_do":
         todo = block["to_do"]
         text = rich_text_to_html(todo.get("rich_text", []))
         checked = todo.get("checked", False)
         data_tag = "to-do:completed" if checked else "to-do"
-        return f'<p data-tag="{data_tag}">{text}</p>'
+        return f'<p style="{_FP}" data-tag="{data_tag}">{text}</p>'
 
     if btype == "code":
         code_data = block["code"]
         text = rich_text_to_html(code_data.get("rich_text", []))
         lang = code_data.get("language", "")
-        return f'<pre data-notion-language="{escape(lang)}"><code>{text}</code></pre>'
+        return f'<pre style="{_FP}" data-notion-language="{escape(lang)}"><code>{text}</code></pre>'
 
     if btype == "quote":
         text = rich_text_to_html(block["quote"].get("rich_text", []))
         children_html = ""
         children = block["quote"].get("children") or block.get("children", [])
         if children:
-            children_html = blocks_to_html(children)
-        return f"<blockquote>{text}{children_html}</blockquote>"
+            children_html = blocks_to_html(children, width_px=width_px)
+        return f'<blockquote style="{_FP}">{text}{children_html}</blockquote>'
 
     if btype == "callout":
-        return _callout_to_html(block, depth)
+        return _callout_to_html(block, depth, width_px=width_px)
 
     if btype == "toggle":
         toggle = block["toggle"]
@@ -211,8 +207,8 @@ def _block_to_html_inner(block: dict, depth: int = 0) -> str:
         children_html = ""
         children = toggle.get("children") or block.get("children", [])
         if children:
-            children_html = blocks_to_html(children)
-        return f"<h3>{text}</h3>{children_html}"
+            children_html = blocks_to_html(children, width_px=width_px)
+        return f'<h3 style="{_FP}">{text}</h3>{children_html}'
 
     if btype == "image":
         img = block["image"]
@@ -222,13 +218,13 @@ def _block_to_html_inner(block: dict, depth: int = 0) -> str:
         elif img.get("type") == "file":
             url = img["file"]["url"]
         caption = rich_text_to_html(img.get("caption", []))
-        html = f'<img src="{escape(url)}" alt="{escape(caption)}" />'
+        html = f'<img style="{_FP}" src="{escape(url)}" alt="{escape(caption)}" />'
         if caption:
-            html += f"<p><em>{caption}</em></p>"
+            html += f'<p style="{_FP}"><em>{caption}</em></p>'
         return html
 
     if btype == "divider":
-        return "<hr />"
+        return f'<hr style="{_FP}" />'
 
     if btype == "table":
         table_data = block["table"]
@@ -243,27 +239,40 @@ def _block_to_html_inner(block: dict, depth: int = 0) -> str:
                 for cell in cells
             )
             rows_html.append(f"<tr>{cells_html}</tr>")
-        return f'<table data-notion-type="table">{"".join(rows_html)}</table>'
+        return f'<table style="{_FP}" data-notion-type="table">{"".join(rows_html)}</table>'
 
     if btype == "column_list":
         children = block.get("children", [])
-        parts = []
+        if not children:
+            return ""
+        num_cols = len(children)
+        col_px = (width_px - num_cols * 16) // num_cols
+        cells = []
         for col in children:
             col_children = col.get("children", [])
-            parts.append(blocks_to_html(col_children))
-        return "".join(parts)
+            col_html = blocks_to_html(col_children, width_px=col_px)
+            cells.append(
+                f'<td style="width:{col_px}px;vertical-align:top;padding:0 8px;">'
+                f"{col_html}</td>"
+            )
+        return (
+            f'<table data-notion-type="column_list"'
+            f' style="{_FP};table-layout:fixed;border-collapse:collapse;'
+            f'width:{width_px}px;">'
+            f'<tr>{"".join(cells)}</tr>'
+            f"</table>"
+        )
 
     if btype == "bookmark":
         url = block["bookmark"].get("url", "")
         caption = rich_text_to_html(block["bookmark"].get("caption", []))
         label = caption or escape(url)
-        return f'<p><a href="{escape(url)}">{label}</a></p>'
+        return f'<p style="{_FP}"><a href="{escape(url)}">{label}</a></p>'
 
-    # Unsupported block type — render as empty paragraph
-    return f'<p data-notion-unsupported="{escape(btype)}">&nbsp;</p>'
+    return f'<p style="{_FP}" data-notion-unsupported="{escape(btype)}">&nbsp;</p>'
 
 
-def blocks_to_html(blocks: list[dict]) -> str:
+def blocks_to_html(blocks: list[dict], width_px: int = ONENOTE_PAGE_WIDTH_PX) -> str:
     """Convert a list of Notion blocks to HTML, grouping consecutive list items."""
     html_parts: list[str] = []
     i = 0
@@ -273,7 +282,7 @@ def blocks_to_html(blocks: list[dict]) -> str:
             chunk, i = _list_items_to_html(blocks, i, btype)
             html_parts.append(chunk)
         else:
-            html_parts.append(_block_to_html_inner(blocks[i]))
+            html_parts.append(_block_to_html_inner(blocks[i], width_px=width_px))
             i += 1
     return "".join(html_parts)
 
@@ -281,15 +290,14 @@ def blocks_to_html(blocks: list[dict]) -> str:
 def page_to_html(title: str, blocks: list[dict]) -> str:
     """Build a full OneNote page HTML document from a Notion page."""
     body = blocks_to_html(blocks)
+    created = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
     return (
-        '<!DOCTYPE html>\n'
-        '<html>\n'
-        '<head>\n'
-        f'  <title>{escape(title)}</title>\n'
-        '</head>\n'
-        '<body>\n'
-        f'{body}\n'
-        '</body>\n'
+        '<html>'
+        '<head>'
+        f'<title>{escape(title)}</title>'
+        f'<meta name="created" content="{created}" />'
+        '</head>'
+        f'<body>{body}</body>'
         '</html>'
     )
 

@@ -21,6 +21,10 @@ _MIGRATION_COLUMNS = [
     ("parent_notion_id", "TEXT"),
     ("onenote_section_id", "TEXT"),
     ("page_level", "INTEGER DEFAULT -1"),
+    ("section_mode", "TEXT DEFAULT 'grouped'"),
+    ("sync_section_name", "TEXT"),
+    ("sync_section_group_path", "TEXT"),
+    ("sync_use_flat_section", "INTEGER DEFAULT 0"),
 ]
 
 
@@ -52,7 +56,11 @@ def init_db(db_path: Optional[Path] = None) -> None:
             conversion_notes  TEXT,
             parent_notion_id  TEXT,
             onenote_section_id TEXT,
-            page_level        INTEGER DEFAULT -1
+            page_level        INTEGER DEFAULT -1,
+            section_mode      TEXT DEFAULT 'grouped',
+            sync_section_name     TEXT,
+            sync_section_group_path TEXT,
+            sync_use_flat_section INTEGER DEFAULT 0
         )
     """)
     _migrate(conn)
@@ -82,7 +90,10 @@ class SyncStateDB:
         conversion_notes: Optional[str] = None,
         parent_notion_id: Optional[str] = None,
         onenote_section_id: Optional[str] = None,
-        page_level: Optional[int] = None,
+        section_mode: Optional[str] = None,
+        sync_section_name: Optional[str] = None,
+        sync_section_group_path: Optional[str] = None,
+        sync_use_flat_section: Optional[bool] = None,
     ) -> None:
         conn = self._conn()
         now = datetime.now(timezone.utc).isoformat()
@@ -92,21 +103,25 @@ class SyncStateDB:
                 notion_page_id, onenote_page_id, notion_title,
                 last_notion_edit, last_onenote_edit, last_synced,
                 content_hash, last_source, sync_status, conversion_notes,
-                parent_notion_id, onenote_section_id, page_level
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                parent_notion_id, onenote_section_id, section_mode,
+                sync_section_name, sync_section_group_path, sync_use_flat_section
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(notion_page_id) DO UPDATE SET
                 onenote_page_id   = COALESCE(excluded.onenote_page_id, page_sync.onenote_page_id),
                 notion_title      = COALESCE(excluded.notion_title, page_sync.notion_title),
                 last_notion_edit  = COALESCE(excluded.last_notion_edit, page_sync.last_notion_edit),
                 last_onenote_edit = COALESCE(excluded.last_onenote_edit, page_sync.last_onenote_edit),
                 last_synced       = excluded.last_synced,
-                content_hash      = COALESCE(excluded.content_hash, page_sync.content_hash),
+                content_hash      = excluded.content_hash,
                 last_source       = COALESCE(excluded.last_source, page_sync.last_source),
                 sync_status       = excluded.sync_status,
                 conversion_notes  = COALESCE(excluded.conversion_notes, page_sync.conversion_notes),
                 parent_notion_id  = COALESCE(excluded.parent_notion_id, page_sync.parent_notion_id),
                 onenote_section_id= COALESCE(excluded.onenote_section_id, page_sync.onenote_section_id),
-                page_level        = COALESCE(excluded.page_level, page_sync.page_level)
+                section_mode      = COALESCE(excluded.section_mode, page_sync.section_mode),
+                sync_section_name       = COALESCE(excluded.sync_section_name, page_sync.sync_section_name),
+                sync_section_group_path = COALESCE(excluded.sync_section_group_path, page_sync.sync_section_group_path),
+                sync_use_flat_section   = COALESCE(excluded.sync_use_flat_section, page_sync.sync_use_flat_section)
             """,
             (
                 notion_page_id, onenote_page_id, notion_title,
@@ -114,7 +129,9 @@ class SyncStateDB:
                 last_onenote_edit.isoformat() if last_onenote_edit else None,
                 now,
                 content_hash, last_source, sync_status, conversion_notes,
-                parent_notion_id, onenote_section_id, page_level,
+                parent_notion_id, onenote_section_id, section_mode,
+                sync_section_name, sync_section_group_path,
+                int(sync_use_flat_section) if sync_use_flat_section is not None else None,
             ),
         )
         conn.commit()
@@ -205,6 +222,34 @@ class SyncStateDB:
         ).fetchone()
         conn.close()
         return row["ts"] if row else None
+
+    def reset_subtree(self, root_notion_id: str) -> None:
+        """Clear all OneNote IDs for a root page and every descendant.
+
+        Used when section_mode changes (flat ↔ grouped) so that the next sync
+        recreates everything in the correct structure. The old OneNote section
+        or section group will be orphaned — manual cleanup in OneNote required.
+        """
+        conn = self._conn()
+        conn.execute(
+            """
+            WITH RECURSIVE descendants(id) AS (
+                SELECT notion_page_id FROM page_sync WHERE notion_page_id = ?
+                UNION ALL
+                SELECT p.notion_page_id FROM page_sync p
+                JOIN descendants d ON p.parent_notion_id = d.id
+            )
+            UPDATE page_sync
+            SET onenote_page_id    = NULL,
+                onenote_section_id = NULL,
+                section_mode       = NULL,
+                sync_status        = 'pending'
+            WHERE notion_page_id IN (SELECT id FROM descendants)
+            """,
+            (root_notion_id,),
+        )
+        conn.commit()
+        conn.close()
 
     def delete_page(self, notion_page_id: str) -> None:
         conn = self._conn()

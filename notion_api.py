@@ -1,6 +1,7 @@
 """Notion API wrapper. Queries database, fetches block trees, creates/updates pages."""
 
 import logging
+import threading
 import time
 from datetime import datetime
 from typing import Optional
@@ -18,15 +19,50 @@ class NotionSync:
         self._token = token or config.NOTION_TOKEN
         self._database_id = database_id or config.NOTION_DATABASE_ID
         self._client = Client(auth=self._token)
+        logging.getLogger("httpx").setLevel(logging.WARNING)
         self._last_request_time = 0.0
+        self._rate_lock = threading.Lock()
+        self._data_source_id_cache: Optional[str] = None
+
+    def _uses_data_source_query(self) -> bool:
+        """notion-client 3+ drops databases.query; use data_sources.query instead."""
+        return not hasattr(self._client.databases, "query")
+
+    def _get_data_source_id(self) -> str:
+        """Resolve the collection used for database queries (Notion API 2025+)."""
+        if self._data_source_id_cache:
+            return self._data_source_id_cache
+        explicit = (config.NOTION_DATA_SOURCE_ID or "").strip()
+        if explicit:
+            self._data_source_id_cache = explicit
+            return explicit
+        db = self._api_call(self._client.databases.retrieve, self._database_id)
+        sources = db.get("data_sources") or []
+        if not sources:
+            raise RuntimeError(
+                "Database has no data_sources; set NOTION_DATA_SOURCE_ID in .env if needed."
+            )
+        if len(sources) > 1:
+            logger.warning(
+                "Database has %d data sources; using first (%s). "
+                "Set NOTION_DATA_SOURCE_ID to pick another.",
+                len(sources),
+                sources[0].get("name", "?"),
+            )
+        ds_id = sources[0].get("id")
+        if not ds_id:
+            raise RuntimeError("Could not read data source id from database response.")
+        self._data_source_id_cache = ds_id
+        return ds_id
 
     def _rate_limit(self) -> None:
-        """Enforce Notion's 3 req/sec rate limit."""
-        min_interval = 1.0 / config.NOTION_API_RATE_LIMIT
-        elapsed = time.time() - self._last_request_time
-        if elapsed < min_interval:
-            time.sleep(min_interval - elapsed)
-        self._last_request_time = time.time()
+        """Enforce Notion's 3 req/sec rate limit (thread-safe)."""
+        with self._rate_lock:
+            min_interval = 1.0 / config.NOTION_API_RATE_LIMIT
+            elapsed = time.time() - self._last_request_time
+            if elapsed < min_interval:
+                time.sleep(min_interval - elapsed)
+            self._last_request_time = time.time()
 
     def _api_call(self, fn, *args, **kwargs):
         """Execute an API call with rate limiting and retry on 429."""
@@ -58,13 +94,22 @@ class NotionSync:
         next_cursor = None
 
         while has_more:
-            response = self._api_call(
-                self._client.databases.query,
-                database_id=self._database_id,
-                start_cursor=next_cursor,
-                page_size=page_size,
-                **filter_params,
-            )
+            if self._uses_data_source_query():
+                response = self._api_call(
+                    self._client.data_sources.query,
+                    self._get_data_source_id(),
+                    start_cursor=next_cursor,
+                    page_size=page_size,
+                    **filter_params,
+                )
+            else:
+                response = self._api_call(
+                    self._client.databases.query,
+                    database_id=self._database_id,
+                    start_cursor=next_cursor,
+                    page_size=page_size,
+                    **filter_params,
+                )
             all_pages.extend(response["results"])
             has_more = response.get("has_more", False)
             next_cursor = response.get("next_cursor")
@@ -106,9 +151,13 @@ class NotionSync:
 
     def create_page(self, title: str, children: list[dict]) -> dict:
         """Create a new page in the sync database."""
+        if self._uses_data_source_query():
+            parent: dict = {"data_source_id": self._get_data_source_id()}
+        else:
+            parent = {"database_id": self._database_id}
         return self._api_call(
             self._client.pages.create,
-            parent={"database_id": self._database_id},
+            parent=parent,
             properties={
                 "title": {"title": [{"text": {"content": title}}]},
             },
@@ -137,6 +186,13 @@ class NotionSync:
                     block_id=page_id,
                     children=batch,
                 )
+
+    def get_flat_section(self, page: dict) -> bool:
+        """Return True if the page has the Flat Section checkbox checked."""
+        prop = page.get("properties", {}).get(config.NOTION_FLAT_SECTION_PROPERTY)
+        if not prop or prop.get("type") != "checkbox":
+            return False
+        return bool(prop.get("checkbox", False))
 
     def get_parent_id(self, page: dict) -> Optional[str]:
         """Extract the parent page ID from the configured relation property."""

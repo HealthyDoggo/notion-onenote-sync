@@ -1,38 +1,42 @@
 %%{ init: { "theme": "default", "flowchart": { "curve": "basis" } } }%%
 flowchart TD
-    start(["Section Resolution Start"])
+    start(["Hierarchy + Main resolution<br/><br/><b>Inputs from payload:</b><br/>section_group_path: string[]<br/><i>folder names outer → inner</i><br/>section_name: string <i>(root topic; legacy / display)</i><br/>onenote_section_id: string | null <i>(cached Main Key)</i>"])
+ 
+    check_id{"payload.onenote_section_id<br/>is non-empty?"}
 
-    check_id{"onenote_section_id<br/>in payload?"}
+    use_provided["Use payload.onenote_section_id<br/><i>skip folder walk</i>"]
 
-    use_provided["Use provided section ID"]
+    walk["<b>Walk path segments</b><br/>parent = notebook (or fixed<br/>Class Notebook parent)<br/>For each name in<br/>payload.section_group_path:<br/>get-or-create <b>section group</b><br/>named that segment"]
 
-    get_sections["<b>Get sections</b><br/>OneNote Business connector<br/>List all sections in<br/>Class Notebook"]
+    main_need["<b>Innermost group</b><br/>get-or-create section<br/><b>Main</b>"]
 
-    filter["<b>Filter array</b><br/>displayName == section_name"]
+    get_sections["<b>List children</b> under parent<br/><i>OneNote / Graph as available</i>"]
 
-    found{"Section<br/>found?"}
+    filter["<b>Find by display name</b><br/>match segment or 'Main'"]
 
-    use_existing["Use existing section ID"]
+    found{"Exists?"}
 
-    create["<b>Create section</b><br/>in personal OneDrive notebook<br/><i>OneNote Business connector</i>"]
+    use_existing["Use existing id / Key"]
 
-    copy["<b>Copy .one file</b><br/>OneDrive → SharePoint<br/><i>SharePoint connector</i><br/><br/>Source:<br/>Documents/Sean @ LDE UTC/<br/>{section_name}.one<br/><br/>Destination:<br/>/sites/PsychologyKS525-27/<br/>SiteAssets/.../<br/>Sean Cassidy - LDE Learner/<br/>{section_name}.one"]
+    create["<b>Create missing group or Main</b><br/><i>OneNote Business connector<br/>or personal NB + .one copy</i>"]
+
+    copy["<b>Copy .one file</b><br/>OneDrive → SharePoint<br/><i>SharePoint connector</i><br/><br/>When workaround applies,<br/>name files to match<br/>segment or 'Main'"]
 
     wait["<b>Delay 45 seconds</b><br/>Wait for OneNote to<br/>register the .one file"]
 
     re_get["<b>Get sections</b><br/>Re-query Class Notebook"]
 
-    re_filter["<b>Filter array</b><br/>Find newly created section"]
+    re_filter["<b>Filter array</b><br/>Find newly created group / Main"]
 
-    use_new["Use new section ID"]
+    use_new["Use new section Key"]
 
     delete["<b>Delete .one</b><br/>from personal notebook<br/><i>OneDrive connector</i>"]
 
-    done(["var_section_id set<br/>→ proceed to page create/update"])
+    done(["var_section_id = Main section Key<br/>→ create / read / replace"])
 
     start --> check_id
     check_id -- "YES" --> use_provided --> done
-    check_id -- "NO" --> get_sections --> filter --> found
+    check_id -- "NO" --> walk --> main_need --> get_sections --> filter --> found
     found -- "YES" --> use_existing --> done
     found -- "NO" --> create --> copy --> wait --> re_get --> re_filter --> use_new --> delete --> done
 
@@ -44,6 +48,6 @@ flowchart TD
 
     class start,done startEnd
     class check_id,found condition
-    class get_sections,filter,create,wait,re_get,re_filter,delete action
+    class walk,main_need,get_sections,filter,create,wait,re_get,re_filter,delete action
     class use_provided,use_existing,use_new shortcut
     class copy copy

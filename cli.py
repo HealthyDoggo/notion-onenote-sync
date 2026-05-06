@@ -35,7 +35,7 @@ def sync(full: bool, force: bool):
     stats = engine.forward_sync(full=full)
     click.echo(
         f"  Created: {stats['created']}  Updated: {stats['updated']}  "
-        f"Skipped: {stats['skipped']}  Errors: {stats['errors']}  "
+        f"Skipped (folders/duplicates): {stats['skipped']}  Errors: {stats['errors']}  "
         f"Sections: {stats['sections_created']}"
     )
     if stats["errors"] > 0:
@@ -102,7 +102,7 @@ def retry_errors():
     stats = engine.forward_sync(full=True)
     click.echo(
         f"  Created: {stats['created']}  Updated: {stats['updated']}  "
-        f"Skipped: {stats['skipped']}  Errors: {stats['errors']}"
+        f"Skipped (folders/duplicates): {stats['skipped']}  Errors: {stats['errors']}"
     )
 
 
