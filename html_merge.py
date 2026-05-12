@@ -1,36 +1,27 @@
-"""Merge fresh Notion HTML with teacher feedback preserved from OneNote.
+"""Merge fresh Notion HTML with teacher feedback (red text) from OneNote.
 
 Strategy:
     1. Parse the current OneNote page HTML.
-    2. Classify each element as "synced" (has our fingerprint style) or
-       "teacher" (no fingerprint, or contains red text).
-    3. Record teacher elements and their positions relative to synced neighbours
-       (by ordinal index, not text content).
-    4. Parse the fresh Notion HTML (all fingerprinted).
-    5. Re-insert teacher elements at their relative positions.
-    6. Return the merged HTML.
+    2. Find all elements containing red-coloured text.
+    3. For each red element, record the plain text of its preceding and
+       following sibling elements as anchors.
+    4. Parse the fresh Notion HTML.
+    5. For each red element, find the best matching position in the fresh
+       HTML by comparing anchor text to element text (fuzzy substring match).
+    6. Insert red elements at their matched positions; append at the end
+       if no match is found.
+    7. Return the merged HTML.
 """
 
 import colorsys
 import logging
 import re
+from difflib import SequenceMatcher
 from typing import Optional
 
 from bs4 import BeautifulSoup, NavigableString, Tag
 
-from config import SYNC_FINGERPRINT_STYLE
-
 logger = logging.getLogger(__name__)
-
-_FP_KEY = SYNC_FINGERPRINT_STYLE.split(":")[0].strip()
-_FP_VAL = SYNC_FINGERPRINT_STYLE.split(":")[1].strip()
-
-
-def _has_fingerprint(el: Tag) -> bool:
-    """Check if an element has our sync fingerprint in its style attribute."""
-    style = el.get("style", "")
-    return _FP_KEY in style and _FP_VAL in style
-
 
 _CSS_NAMED_REDS = {
     "red", "darkred", "firebrick", "crimson", "indianred",
@@ -48,7 +39,6 @@ def _is_red_rgb(r: int, g: int, b: int) -> bool:
     if r < 150 or r <= g or r <= b:
         return False
     h, s, v = colorsys.rgb_to_hsv(r / 255, g / 255, b / 255)
-    # Red hue wraps around 0/1: accept hue < 30° or > 330°, with minimum saturation
     return (h <= 0.083 or h >= 0.917) and s >= 0.3
 
 
@@ -89,8 +79,13 @@ def _has_red_text(el: Tag) -> bool:
     return False
 
 
+def _is_entirely_red(el: Tag) -> bool:
+    """Check if the element itself (not just a child) is red-styled."""
+    return _style_has_red(el.get("style", ""))
+
+
 def _extract_red_spans(el: Tag) -> list:
-    """Extract red-coloured spans/elements from inside a fingerprinted element."""
+    """Extract red-coloured child elements from inside an element."""
     red_parts = []
     for child in el.find_all(True):
         if _style_has_red(child.get("style", "")):
@@ -98,12 +93,17 @@ def _extract_red_spans(el: Tag) -> list:
     return red_parts
 
 
+def _get_text(el: Tag) -> str:
+    """Get normalised plain text from an element."""
+    return el.get_text(separator=" ", strip=True)
+
+
 def _get_body_children(html: str) -> list:
     """Parse HTML and return direct children of the body (or top-level div)."""
     soup = BeautifulSoup(html, "lxml")
     body = soup.find("body")
     if not body:
-        return list(soup.children)
+        return [c for c in soup.children if isinstance(c, Tag)]
 
     div = body.find("div", recursive=False)
     container = div if div else body
@@ -111,128 +111,139 @@ def _get_body_children(html: str) -> list:
     return [c for c in container.children if isinstance(c, Tag)]
 
 
-def classify_elements(onenote_html: str) -> list[dict]:
-    """Classify elements in the OneNote page as synced or teacher content.
+def _text_similarity(a: str, b: str) -> float:
+    """Return similarity ratio between two strings (0.0 to 1.0)."""
+    if not a or not b:
+        return 0.0
+    return SequenceMatcher(None, a.lower(), b.lower()).ratio()
+
+_MATCH_THRESHOLD = 0.5
+
+
+def _find_best_anchor(anchor_text: str, notion_texts: list[str]) -> Optional[int]:
+    """Find the index in notion_texts that best matches anchor_text."""
+    if not anchor_text:
+        return None
+    best_idx = None
+    best_score = _MATCH_THRESHOLD
+    for i, nt in enumerate(notion_texts):
+        score = _text_similarity(anchor_text, nt)
+        if score > best_score:
+            best_score = score
+            best_idx = i
+    return best_idx
+
+
+def extract_red_items(onenote_html: str) -> list[dict]:
+    """Find red text elements in OneNote HTML with their neighboring context.
 
     Returns a list of dicts:
     {
-        "element": Tag,
-        "type": "synced" | "teacher" | "mixed",
-        "red_spans": list[Tag]  (only for "mixed")
+        "html": str,                 # the red element(s) as HTML
+        "prev_text": str | None,     # plain text of previous sibling
+        "next_text": str | None,     # plain text of next sibling
+        "position": "start" | "middle" | "end",
     }
     """
     elements = _get_body_children(onenote_html)
-    classified = []
+    items = []
 
-    for el in elements:
+    for i, el in enumerate(elements):
         if not isinstance(el, Tag):
             continue
+        if not _has_red_text(el):
+            continue
 
-        fp = _has_fingerprint(el)
-        red = _has_red_text(el)
-
-        if fp and red:
-            classified.append({
-                "element": el,
-                "type": "mixed",
-                "red_spans": _extract_red_spans(el),
-            })
-        elif fp:
-            classified.append({
-                "element": el,
-                "type": "synced",
-            })
+        if _is_entirely_red(el):
+            html_str = str(el)
         else:
-            classified.append({
-                "element": el,
-                "type": "teacher",
-            })
+            red_spans = _extract_red_spans(el)
+            if not red_spans:
+                continue
+            html_str = "".join(f"<p>{span}</p>" for span in red_spans)
 
-    return classified
+        prev_el = None
+        for j in range(i - 1, -1, -1):
+            if isinstance(elements[j], Tag) and not _has_red_text(elements[j]):
+                prev_el = elements[j]
+                break
 
+        next_el = None
+        for j in range(i + 1, len(elements)):
+            if isinstance(elements[j], Tag) and not _has_red_text(elements[j]):
+                next_el = elements[j]
+                break
 
-def _build_insertion_map(classified: list[dict]) -> dict:
-    """Build a map of where teacher content should be inserted.
-
-    Returns a dict mapping synced-element ordinal index to a list of
-    teacher elements that follow it. Key -1 means "before the first synced element".
-
-    Example: if the OneNote page has [synced0, teacher_a, synced1, teacher_b],
-    the map is {0: [teacher_a], 1: [teacher_b]}.
-    """
-    insertion_map = {}
-    synced_count = -1
-    pending_teacher = []
-
-    for item in classified:
-        if item["type"] == "synced":
-            if pending_teacher:
-                insertion_map[synced_count] = pending_teacher
-                pending_teacher = []
-            synced_count += 1
+        if prev_el is None:
+            position = "start"
+        elif next_el is None:
+            position = "end"
         else:
-            pending_teacher.append(item)
+            position = "middle"
+        
+        prev_text = _get_text(prev_el) if prev_el is not None else None
+        next_text = _get_text(next_el) if next_el is not None else None
+        items.append({
+            "html": html_str,
+            "prev_text": prev_text,
+            "next_text": next_text,
+            "position": position,
+        })
 
-    if pending_teacher:
-        insertion_map[synced_count] = pending_teacher
+        logger.info(f"Found teacher note: ...{prev_text} {html_str} {next_text}...")
 
-    return insertion_map
-
-
-def _teacher_item_to_html(item: dict) -> str:
-    """Convert a teacher classified item to HTML string."""
-    if item["type"] == "mixed":
-        parts = []
-        for red_span in item.get("red_spans", []):
-            parts.append(f"<p>{red_span}</p>")
-        return "".join(parts)
-    return str(item["element"])
+    return items
 
 
-def merge_html(notion_html: str, onenote_html: str) -> str:
-    """Merge fresh Notion HTML with teacher feedback from the current OneNote page.
+def _html_to_text(html_str: str) -> str:
+    """Extract plain text from an HTML fragment."""
+    soup = BeautifulSoup(html_str, "lxml")
+    return soup.get_text(separator=" ", strip=True)
 
-    Args:
-        notion_html: Fresh HTML generated from current Notion content (all fingerprinted).
-        onenote_html: Current OneNote page HTML (mix of synced + teacher content).
 
-    Returns:
-        Merged HTML with Notion content updated and teacher feedback preserved.
-    """
-    if not onenote_html or not onenote_html.strip():
-        return notion_html
-
-    classified = classify_elements(onenote_html)
-
-    teacher_items = [c for c in classified if c["type"] in ("teacher", "mixed")]
-    if not teacher_items:
-        logger.debug("No teacher content found, using fresh Notion HTML")
-        return notion_html
-
-    insertion_map = _build_insertion_map(classified)
-    if not insertion_map:
-        return notion_html
-
+def _insert_red_items(notion_html: str, red_items: list[dict]) -> str:
+    """Place red items into fresh Notion HTML using text-matching anchors."""
     notion_elements = _get_body_children(notion_html)
+    notion_texts = [_get_text(el) for el in notion_elements]
+    notion_full_text = " ".join(notion_texts).lower()
+
+    insertion_map: dict[int, list[str]] = {}
+
+    for item in red_items:
+        red_text = _html_to_text(item["html"]).strip()
+        if red_text and red_text.lower() in notion_full_text:
+            logger.debug(
+                "Skipping red text already in Notion content: %s",
+                red_text[:80],
+            )
+            continue
+
+        insert_after = None
+
+        if item["position"] == "start":
+            insert_after = -1
+        elif item["prev_text"]:
+            insert_after = _find_best_anchor(item["prev_text"], notion_texts)
+
+        if insert_after is None and item["next_text"]:
+            next_match = _find_best_anchor(item["next_text"], notion_texts)
+            if next_match is not None:
+                insert_after = next_match - 1
+
+        if insert_after is None:
+            insert_after = len(notion_elements) - 1
+
+        insertion_map.setdefault(insert_after, []).append(item["html"])
 
     merged_parts = []
 
     if -1 in insertion_map:
-        for item in insertion_map[-1]:
-            merged_parts.append(_teacher_item_to_html(item))
+        merged_parts.extend(insertion_map[-1])
 
     for i, el in enumerate(notion_elements):
         merged_parts.append(str(el))
-
         if i in insertion_map:
-            for item in insertion_map[i]:
-                merged_parts.append(_teacher_item_to_html(item))
-
-    max_notion_idx = len(notion_elements) - 1
-    for idx, items in insertion_map.items():
-        if idx > max_notion_idx:
-            for item in items:
-                merged_parts.append(_teacher_item_to_html(item))
+            merged_parts.extend(insertion_map[i])
 
     notion_soup = BeautifulSoup(notion_html, "lxml")
     title_el = notion_soup.find("title")
@@ -250,3 +261,40 @@ def merge_html(notion_html: str, onenote_html: str) -> str:
         '</body>\n'
         '</html>'
     )
+
+
+def merge_html(notion_html: str, onenote_html: str) -> str:
+    """Merge fresh Notion HTML with red teacher feedback from OneNote.
+
+    Args:
+        notion_html: Fresh HTML generated from current Notion content.
+        onenote_html: Current OneNote page HTML (may contain red teacher text).
+
+    Returns:
+        Merged HTML with Notion content updated and red teacher text preserved.
+    """
+    if not onenote_html or not onenote_html.strip():
+        return notion_html
+
+    red_items = extract_red_items(onenote_html)
+    if not red_items:
+        logger.debug("No red teacher text found, using fresh Notion HTML")
+        return notion_html
+
+    return _insert_red_items(notion_html, red_items)
+
+
+def merge_harvested(notion_html: str, harvested_items: list[dict]) -> str:
+    """Apply previously harvested red items to fresh Notion HTML.
+
+    Args:
+        notion_html: Fresh HTML generated from current Notion content.
+        harvested_items: Red items from a prior extract_red_items() call,
+            each with "html", "prev_text", "next_text", "position" keys.
+
+    Returns:
+        HTML with red teacher text inserted at matched positions.
+    """
+    if not harvested_items:
+        return notion_html
+    return _insert_red_items(notion_html, harvested_items)

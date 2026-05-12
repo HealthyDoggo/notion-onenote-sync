@@ -16,7 +16,7 @@ from typing import Optional
 
 import config
 from block_converter import content_hash_blocks, page_to_html
-from html_merge import merge_html
+from html_merge import extract_red_items, merge_harvested, merge_html
 from notion_api import NotionSync
 from pa_bridge import PAForwardClient, RateLimitedError, RateLimitGate
 from state_db import SyncStateDB
@@ -38,33 +38,120 @@ class SyncEngine:
         self.pa = pa_client or PAForwardClient(gate=self.gate)
         self._section_cache: dict[tuple[str, ...], str] = {}
         self._section_cache_lock = threading.Lock()
+        self._harvested_red: dict[str, list[dict]] = {}
+        self._progress_callback: Optional[callable] = None
 
-    def forward_sync(self, full: bool = False) -> dict:
-        """Sync changed Notion pages to OneNote via Power Automate.
+    def harvest_teacher_notes(
+        self,
+        max_workers: int = 4,
+        progress_callback: Optional[callable] = None,
+    ) -> dict[str, list[dict]]:
+        """Read all tracked OneNote pages and extract red teacher text.
 
-        Args:
-            full: If True, sync all pages regardless of last sync time.
-
-        Returns:
-            Summary dict with counts.
+        Returns a dict mapping notion_page_id -> list of red items (each with
+        html, prev_text, next_text, position keys).
         """
-        stats = {
-            "created": 0, "updated": 0, "skipped": 0,
-            "errors": 0, "sections_created": 0,
-        }
+        all_pages = self.db.get_all_with_onenote_ids()
+        pages = [p for p in all_pages if p.get("onenote_section_id")]
+        logger.info("Harvesting teacher notes from %d pages", len(pages))
 
+        skipped = len(all_pages) - len(pages)
+        if skipped:
+            logger.warning("Skipped %d page(s) with no section ID", skipped)
+
+        harvested = {}
+        lock = threading.Lock()
+
+        def _harvest_one(page: dict) -> None:
+            notion_id = page["notion_page_id"]
+            onenote_page_id = page["onenote_page_id"]
+            section_id = page["onenote_section_id"]
+            title = page.get("notion_title", notion_id)
+
+            try:
+                self.gate.wait()
+                time.sleep(config.PA_CALL_DELAY)
+                resp = self.pa.read_page(onenote_page_id, onenote_section_id=section_id)
+                current_html = resp.get("current_html", "")
+                if not current_html:
+                    logger.debug("Empty HTML for '%s', skipping", title)
+                    return
+
+                red_items = extract_red_items(current_html)
+                if red_items:
+                    with lock:
+                        harvested[notion_id] = red_items
+                    logger.info(
+                        "Harvested %d red item(s) from '%s'",
+                        len(red_items), title,
+                    )
+            except Exception:
+                logger.warning(
+                    "Could not read '%s' for harvest, skipping",
+                    title, exc_info=True,
+                )
+            finally:
+                if progress_callback:
+                    progress_callback()
+
+        workers = min(len(pages), max_workers) or 1
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            pool.map(_harvest_one, pages)
+
+        logger.info(
+            "Harvest complete: %d pages with teacher notes",
+            len(harvested),
+        )
+        return harvested
+
+    @staticmethod
+    def _count_tree_nodes(roots: list[dict]) -> int:
+        count = 0
+        stack = list(roots)
+        while stack:
+            node = stack.pop()
+            count += 1
+            stack.extend(node.get("_children", []))
+        return count
+
+    def fetch_pages(self, full: bool = False) -> tuple:
+        """Fetch pages from Notion and build the tree.
+
+        Returns (roots, total_count) so callers can set up progress bars
+        before calling sync_fetched().
+        """
         since = None
         if not full:
             last_ts = self.db.get_last_sync_time()
             if last_ts:
                 since = datetime.fromisoformat(last_ts)
 
-        logger.info("Forward sync started (full=%s, since=%s)", full, since)
         pages = self.notion.query_database(since=since if not full else None)
         logger.info("Found %d pages to process", len(pages))
 
         roots = self.notion.build_page_tree(pages)
-        logger.info("Built tree: %d root topics", len(roots))
+        total = self._count_tree_nodes(roots)
+        logger.info("Built tree: %d root topics, %d total nodes", len(roots), total)
+        return roots, total
+
+    def sync_fetched(
+        self,
+        roots: list[dict],
+        full: bool = False,
+        progress_callback: Optional[callable] = None,
+    ) -> dict:
+        """Sync pre-fetched page trees to OneNote.
+
+        Use fetch_pages() first to get roots and total count for progress bars.
+        """
+        self._progress_callback = progress_callback
+
+        stats = {
+            "created": 0, "updated": 0, "skipped": 0,
+            "errors": 0, "sections_created": 0,
+        }
+
+        logger.info("Forward sync started (full=%s)", full)
 
         def _sync_root(root):
             root_stats = {
@@ -95,8 +182,35 @@ class SyncEngine:
                     logger.exception("Error syncing root '%s'", title)
                     stats["errors"] += 1
 
+        self._progress_callback = None
         logger.info("Forward sync complete: %s", stats)
         return stats
+
+    def forward_sync(
+        self,
+        full: bool = False,
+        progress_callback: Optional[callable] = None,
+    ) -> dict:
+        """Fetch pages and sync in one call."""
+        roots, _total = self.fetch_pages(full=full)
+        return self.sync_fetched(roots, full=full, progress_callback=progress_callback)
+
+    def _recover_path_from_parent_chain(self, parent_id: str) -> Optional[list[str]]:
+        """Walk up the parent chain in the DB to reconstruct section_group_path."""
+        path_parts = []
+        current_id = parent_id
+        for _ in range(10):
+            rec = self.db.get_by_notion_id(current_id)
+            if not rec:
+                return None
+            if rec.get("sync_section_group_path"):
+                stored = json.loads(rec["sync_section_group_path"])
+                return stored + path_parts
+            path_parts.insert(0, rec.get("notion_title", ""))
+            if not rec.get("parent_notion_id"):
+                return path_parts
+            current_id = rec["parent_notion_id"]
+        return None
 
     def _sync_tree_node(
         self,
@@ -137,6 +251,20 @@ class SyncEngine:
                     "Recovered stored path for orphan '%s': path=%s, section=%s",
                     title, section_group_path, section_name,
                 )
+            elif existing_rec:
+                recovered_path = self._recover_path_from_parent_chain(parent_id)
+                if recovered_path is not None:
+                    section_group_path = recovered_path
+                    section_name = recovered_path[0] if recovered_path else title
+                    use_flat_section = bool(existing_rec.get("sync_use_flat_section", 0))
+                    section_id = existing_rec.get("onenote_section_id") or section_id
+                    child_parent_context = section_group_path
+                    current_mode = existing_rec.get("section_mode")
+                    orphan_recovered = True
+                    logger.debug(
+                        "Recovered path from parent chain for orphan '%s': path=%s",
+                        title, section_group_path,
+                    )
 
         if is_root and not orphan_recovered:
             section_name = title
@@ -210,6 +338,13 @@ class SyncEngine:
 
                 if existing and existing["content_hash"] == new_hash:
                     logger.debug("Content unchanged for '%s', skipping", title)
+                    if not existing.get("sync_section_group_path"):
+                        self.db.upsert_page(
+                            notion_page_id=notion_id,
+                            sync_section_group_path=json.dumps(section_group_path),
+                            sync_section_name=section_name,
+                            sync_use_flat_section=use_flat_section,
+                        )
                     stats["skipped"] += 1
                 else:
                     html = page_to_html(title, blocks)
@@ -233,8 +368,18 @@ class SyncEngine:
                         use_flat_section=use_flat_section,
                     )
 
+                    action = "replace" if is_update else "create"
                     new_onenote_page_id = response.get("onenote_page_id") or onenote_page_id
                     returned_section_id = response.get("onenote_section_id") or section_id
+
+                    self.db.log_pa_run(
+                        notion_page_id=notion_id,
+                        action=action,
+                        page_title=title,
+                        section_name=section_name,
+                        section_group_path=json.dumps(section_group_path),
+                        run_url=response.get("run_url"),
+                    )
 
                     if returned_section_id:
                         section_id = returned_section_id
@@ -267,8 +412,17 @@ class SyncEngine:
                         logger.info("Created '%s' in OneNote (section=%s, flat=%s)",
                                     title, section_name, use_flat_section)
 
-        except Exception:
+        except Exception as exc:
             logger.exception("Error syncing page '%s' (%s)", title, notion_id)
+            self.db.log_pa_run(
+                notion_page_id=notion_id,
+                action="replace" if (existing and existing.get("onenote_page_id")) else "create",
+                page_title=title,
+                section_name=section_name,
+                section_group_path=json.dumps(section_group_path),
+                status="error",
+                error_message=str(exc),
+            )
             self.db.upsert_page(
                 notion_page_id=notion_id,
                 notion_title=title,
@@ -278,6 +432,9 @@ class SyncEngine:
                 parent_notion_id=parent_id,
             )
             stats["errors"] += 1
+
+        if self._progress_callback:
+            self._progress_callback()
 
         if is_root and not section_id:
             rec = self.db.get_by_notion_id(notion_id)
@@ -340,10 +497,18 @@ class SyncEngine:
                         use_flat_section=use_flat_section,
                     )
                 else:
+                    create_html = html
+                    harvested = self._harvested_red.get(notion_id)
+                    if harvested:
+                        create_html = merge_harvested(html, harvested)
+                        logger.info(
+                            "Applied %d harvested red item(s) to '%s'",
+                            len(harvested), title,
+                        )
                     return self.pa.send_page(
                         section_name=section_name,
                         title=title,
-                        html_body=html,
+                        html_body=create_html,
                         notion_page_id=notion_id,
                         action="create",
                         onenote_section_id=section_id,

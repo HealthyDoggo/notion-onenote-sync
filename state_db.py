@@ -63,6 +63,28 @@ def init_db(db_path: Optional[Path] = None) -> None:
             sync_use_flat_section INTEGER DEFAULT 0
         )
     """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS pa_run_log (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            notion_page_id  TEXT NOT NULL REFERENCES page_sync(notion_page_id),
+            timestamp       DATETIME NOT NULL,
+            action          TEXT NOT NULL,
+            page_title      TEXT,
+            section_name    TEXT,
+            section_group_path TEXT,
+            run_url         TEXT,
+            status          TEXT,
+            error_message   TEXT
+        )
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_pa_run_log_page
+        ON pa_run_log(notion_page_id)
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_pa_run_log_timestamp
+        ON pa_run_log(timestamp DESC)
+    """)
     _migrate(conn)
     conn.commit()
     conn.close()
@@ -259,6 +281,86 @@ class SyncStateDB:
         )
         conn.commit()
         conn.close()
+
+    def get_all_with_onenote_ids(self) -> list[dict]:
+        conn = self._conn()
+        rows = conn.execute(
+            "SELECT * FROM page_sync WHERE onenote_page_id IS NOT NULL"
+        ).fetchall()
+        conn.close()
+        return [dict(r) for r in rows]
+
+    def reset_all(self) -> None:
+        """Clear all OneNote tracking fields so every page is recreated on next sync."""
+        conn = self._conn()
+        conn.execute("""
+            UPDATE page_sync SET
+                onenote_page_id    = NULL,
+                onenote_section_id = NULL,
+                content_hash       = NULL,
+                section_mode       = NULL,
+                sync_status        = 'pending'
+        """)
+        conn.commit()
+        conn.close()
+
+    def log_pa_run(
+        self,
+        notion_page_id: str,
+        action: str,
+        *,
+        page_title: Optional[str] = None,
+        section_name: Optional[str] = None,
+        section_group_path: Optional[str] = None,
+        run_url: Optional[str] = None,
+        status: str = "success",
+        error_message: Optional[str] = None,
+    ) -> None:
+        conn = self._conn()
+        conn.execute(
+            """
+            INSERT INTO pa_run_log (
+                notion_page_id, timestamp, action, page_title,
+                section_name, section_group_path, run_url,
+                status, error_message
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                notion_page_id,
+                datetime.now(timezone.utc).isoformat(),
+                action, page_title, section_name, section_group_path,
+                run_url, status, error_message,
+            ),
+        )
+        conn.commit()
+        conn.close()
+
+    def get_recent_runs(self, limit: int = 20) -> list[dict]:
+        conn = self._conn()
+        rows = conn.execute(
+            "SELECT * FROM pa_run_log ORDER BY timestamp DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+        conn.close()
+        return [dict(r) for r in rows]
+
+    def get_runs_for_page(self, notion_page_id: str) -> list[dict]:
+        conn = self._conn()
+        rows = conn.execute(
+            "SELECT * FROM pa_run_log WHERE notion_page_id = ? ORDER BY timestamp DESC",
+            (notion_page_id,),
+        ).fetchall()
+        conn.close()
+        return [dict(r) for r in rows]
+
+    def get_error_runs(self, limit: int = 20) -> list[dict]:
+        conn = self._conn()
+        rows = conn.execute(
+            "SELECT * FROM pa_run_log WHERE status = 'error' ORDER BY timestamp DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+        conn.close()
+        return [dict(r) for r in rows]
 
     def count_by_status(self) -> dict[str, int]:
         conn = self._conn()

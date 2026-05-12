@@ -1,9 +1,10 @@
 """Power Automate bridge — one-way forward sync (Notion -> OneNote).
 
-POSTs page data to the PA webhook. Supports three actions:
+POSTs page data to the PA webhook. Supports four actions:
   - create:  Create a new page in a section
   - read:    Read current page HTML (for merge before update)
   - replace: Delete old page + create new page with merged content
+  - delete:  Delete a page from OneNote
 """
 
 import logging
@@ -167,6 +168,18 @@ class PAForwardClient:
         logger.info("PA responded: %s", data)
         return data
 
+    def delete_page(self, onenote_page_id: str, onenote_section_id: Optional[str] = None) -> dict:
+        """Delete a page from OneNote via Power Automate."""
+        payload = {
+            "action": "delete",
+            "onenote_page_id": onenote_page_id,
+            "onenote_section_id": onenote_section_id,
+        }
+        logger.info("Deleting OneNote page %s", onenote_page_id)
+        data = self._post(payload)
+        logger.info("PA responded: %s", data)
+        return data
+
     def read_page(self, onenote_page_id: str, onenote_section_id: Optional[str] = None) -> dict:
         """Read current OneNote page HTML for merge.
 
@@ -177,7 +190,7 @@ class PAForwardClient:
             "onenote_page_id": onenote_page_id,
             "onenote_section_id": onenote_section_id,
         }
-        logger.info("Reading OneNote page %s for merge", onenote_page_id)
+        logger.debug("Reading OneNote page %s for merge", onenote_page_id)
         data = self._post(payload)
-        logger.info("PA returned %d chars of HTML", len(data.get("current_html", "")))
+        logger.debug("PA returned %d chars of HTML", len(data.get("current_html", "")))
         return data

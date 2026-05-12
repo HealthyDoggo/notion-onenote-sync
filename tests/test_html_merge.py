@@ -1,11 +1,8 @@
-"""Tests for HTML merge logic — preserving teacher feedback during updates."""
+"""Tests for HTML merge logic — preserving red teacher text during updates."""
 
 import pytest
 
-from config import SYNC_FINGERPRINT_STYLE
-from html_merge import classify_elements, merge_html
-
-_FP = SYNC_FINGERPRINT_STYLE
+from html_merge import extract_red_items, merge_html
 
 
 def _page(body_content: str) -> str:
@@ -15,44 +12,53 @@ def _page(body_content: str) -> str:
     )
 
 
-def _fp(tag: str, content: str, extra_style: str = "") -> str:
-    style = f"{_FP};{extra_style}" if extra_style else _FP
-    return f'<{tag} style="{style}">{content}</{tag}>'
+class TestExtractRedItems:
+    def test_no_red_text(self):
+        html = _page('<p>Normal text</p><p>More text</p>')
+        assert extract_red_items(html) == []
 
-
-class TestClassifyElements:
-    def test_all_synced(self):
+    def test_standalone_red_paragraph(self):
         html = _page(
-            f'<p style="{_FP}">Para 1</p>'
-            f'<p style="{_FP}">Para 2</p>'
+            '<p>Before</p>'
+            '<p style="color:red">Teacher comment</p>'
+            '<p>After</p>'
         )
-        classified = classify_elements(html)
-        assert all(c["type"] == "synced" for c in classified)
+        items = extract_red_items(html)
+        assert len(items) == 1
+        assert "Teacher comment" in items[0]["html"]
+        assert items[0]["prev_text"] == "Before"
+        assert items[0]["next_text"] == "After"
+        assert items[0]["position"] == "middle"
 
-    def test_teacher_paragraph(self):
+    def test_red_at_start(self):
         html = _page(
-            f'<p style="{_FP}">Synced para</p>'
-            '<p>Teacher comment</p>'
+            '<p style="color:red">Top feedback</p>'
+            '<p>Content</p>'
         )
-        classified = classify_elements(html)
-        assert classified[0]["type"] == "synced"
-        assert classified[1]["type"] == "teacher"
+        items = extract_red_items(html)
+        assert len(items) == 1
+        assert items[0]["position"] == "start"
+        assert items[0]["prev_text"] is None
+        assert items[0]["next_text"] == "Content"
 
-    def test_red_text_detected_as_teacher(self):
+    def test_red_at_end(self):
         html = _page(
-            f'<p style="{_FP}">My notes</p>'
-            '<p style="color:red">Good work! - Teacher</p>'
+            '<p>Content</p>'
+            '<p style="color:red">Final note</p>'
         )
-        classified = classify_elements(html)
-        assert classified[1]["type"] == "teacher"
+        items = extract_red_items(html)
+        assert len(items) == 1
+        assert items[0]["position"] == "end"
+        assert items[0]["prev_text"] == "Content"
+        assert items[0]["next_text"] is None
 
-    def test_mixed_element_with_red_span(self):
+    def test_red_span_inside_paragraph(self):
         html = _page(
-            f'<p style="{_FP}">My text <span style="color:red">teacher inline</span></p>'
+            '<p>Some text <span style="color:red">inline feedback</span> more text</p>'
         )
-        classified = classify_elements(html)
-        assert classified[0]["type"] == "mixed"
-        assert len(classified[0]["red_spans"]) == 1
+        items = extract_red_items(html)
+        assert len(items) == 1
+        assert "inline feedback" in items[0]["html"]
 
     def test_red_hex_variants(self):
         html = _page(
@@ -60,93 +66,98 @@ class TestClassifyElements:
             '<p style="color:#FF0000">Feedback 2</p>'
             '<p style="color:#e03e3e">Feedback 3</p>'
         )
-        classified = classify_elements(html)
-        for c in classified:
-            assert c["type"] == "teacher"
+        items = extract_red_items(html)
+        assert len(items) == 3
+
+    def test_skips_non_red_neighbours_for_anchors(self):
+        html = _page(
+            '<p>Anchor A</p>'
+            '<p style="color:red">Red 1</p>'
+            '<p style="color:red">Red 2</p>'
+            '<p>Anchor B</p>'
+        )
+        items = extract_red_items(html)
+        assert len(items) == 2
+        assert items[0]["prev_text"] == "Anchor A"
+        assert items[0]["next_text"] == "Anchor B"
+        assert items[1]["prev_text"] == "Anchor A"
+        assert items[1]["next_text"] == "Anchor B"
 
 
 class TestMergeHtml:
-    def test_no_teacher_content(self):
-        notion = _page(_fp("p", "Updated text"))
-        onenote = _page(f'<p style="{_FP}">Old text</p>')
+    def test_no_red_text_returns_notion(self):
+        notion = _page('<p>Updated text</p>')
+        onenote = _page('<p>Old text</p>')
         result = merge_html(notion, onenote)
         assert "Updated text" in result
         assert "Old text" not in result
 
-    def test_preserves_teacher_paragraph_between_synced(self):
-        notion = _page(
-            _fp("p", "Para A updated") + _fp("p", "Para B updated")
-        )
+    def test_preserves_red_between_paragraphs(self):
+        notion = _page('<p>Para A updated</p><p>Para B updated</p>')
         onenote = _page(
-            f'<p style="{_FP}">Para A old</p>'
-            '<p>Teacher says: nice work</p>'
-            f'<p style="{_FP}">Para B old</p>'
+            '<p>Para A old</p>'
+            '<p style="color:red">Teacher says: nice work</p>'
+            '<p>Para B old</p>'
         )
         result = merge_html(notion, onenote)
         assert "Para A updated" in result
         assert "Para B updated" in result
         assert "Teacher says: nice work" in result
+        assert "Para A old" not in result
 
-    def test_preserves_teacher_paragraph_at_end(self):
-        notion = _page(_fp("p", "Content"))
+    def test_preserves_red_at_end(self):
+        notion = _page('<p>Content</p>')
         onenote = _page(
-            f'<p style="{_FP}">Content old</p>'
+            '<p>Content old</p>'
             '<p style="color:red">Final feedback</p>'
         )
         result = merge_html(notion, onenote)
         assert "Content" in result
         assert "Final feedback" in result
 
-    def test_preserves_teacher_paragraph_at_top(self):
-        notion = _page(_fp("p", "My content"))
+    def test_preserves_red_at_start(self):
+        notion = _page('<p>My content</p>')
         onenote = _page(
             '<p style="color:red">Please review this</p>'
-            f'<p style="{_FP}">My content old</p>'
+            '<p>My content old</p>'
         )
         result = merge_html(notion, onenote)
         assert "My content" in result
         assert "Please review this" in result
 
-    def test_mixed_element_preserves_red_spans(self):
-        notion = _page(_fp("p", "Fresh text"))
+    def test_red_span_extracted_from_paragraph(self):
+        notion = _page('<p>Fresh text</p>')
         onenote = _page(
-            f'<p style="{_FP}">Old text <span style="color:red">good!</span></p>'
+            '<p>Old text <span style="color:red">good!</span></p>'
         )
         result = merge_html(notion, onenote)
         assert "Fresh text" in result
         assert "good!" in result
 
     def test_empty_onenote_returns_notion(self):
-        notion = _page(_fp("p", "New content"))
+        notion = _page('<p>New content</p>')
         result = merge_html(notion, "")
         assert "New content" in result
 
-    def test_multiple_teacher_insertions(self):
-        notion = _page(
-            _fp("p", "A") + _fp("p", "B") + _fp("p", "C")
-        )
+    def test_multiple_red_insertions(self):
+        notion = _page('<p>A</p><p>B</p><p>C</p>')
         onenote = _page(
-            f'<p style="{_FP}">A old</p>'
-            '<p>Teacher note 1</p>'
-            f'<p style="{_FP}">B old</p>'
-            '<p>Teacher note 2</p>'
-            f'<p style="{_FP}">C old</p>'
+            '<p>A</p>'
+            '<p style="color:red">Teacher note 1</p>'
+            '<p>B</p>'
+            '<p style="color:red">Teacher note 2</p>'
+            '<p>C</p>'
         )
         result = merge_html(notion, onenote)
-        assert "A" in result
-        assert "B" in result
-        assert "C" in result
         assert "Teacher note 1" in result
         assert "Teacher note 2" in result
 
     def test_notion_adds_new_block_teacher_preserved(self):
-        notion = _page(
-            _fp("p", "Para A") + _fp("p", "New Para") + _fp("p", "Para B")
-        )
+        notion = _page('<p>Para A</p><p>New Para</p><p>Para B</p>')
         onenote = _page(
-            f'<p style="{_FP}">Para A</p>'
-            '<p>Teacher comment</p>'
-            f'<p style="{_FP}">Para B</p>'
+            '<p>Para A</p>'
+            '<p style="color:red">Teacher comment</p>'
+            '<p>Para B</p>'
         )
         result = merge_html(notion, onenote)
         assert "Para A" in result
@@ -154,17 +165,52 @@ class TestMergeHtml:
         assert "Para B" in result
         assert "Teacher comment" in result
 
-    def test_notion_deletes_block_teacher_preserved(self):
-        notion = _page(_fp("p", "Para B"))
+    def test_notion_deletes_block_teacher_appended(self):
+        notion = _page('<p>Para B</p>')
         onenote = _page(
-            f'<p style="{_FP}">Para A old</p>'
-            '<p>Teacher comment after A</p>'
-            f'<p style="{_FP}">Para B old</p>'
+            '<p>Para A old</p>'
+            '<p style="color:red">Teacher comment after A</p>'
+            '<p>Para B old</p>'
         )
         result = merge_html(notion, onenote)
         assert "Para B" in result
         assert "Teacher comment after A" in result
-        assert "Para A old" not in result
+
+    def test_text_matching_with_similar_content(self):
+        notion = _page(
+            '<p>The quick brown fox jumps over the lazy dog</p>'
+            '<p>Another paragraph here</p>'
+        )
+        onenote = _page(
+            '<p>The quick brown fox jumps over the lazy dog</p>'
+            '<p style="color:red">Great sentence!</p>'
+            '<p>Another paragraph here</p>'
+        )
+        result = merge_html(notion, onenote)
+        pos_fox = result.find("quick brown fox")
+        pos_red = result.find("Great sentence!")
+        pos_another = result.find("Another paragraph")
+        assert pos_fox < pos_red < pos_another
+
+
+    def test_skips_red_text_already_in_notion(self):
+        notion = _page('<p>Some intro</p><p>Important warning</p>')
+        onenote = _page(
+            '<p>Some intro</p>'
+            '<p style="color:red">Important warning</p>'
+        )
+        result = merge_html(notion, onenote)
+        assert result.count("Important warning") == 1
+
+    def test_keeps_red_text_not_in_notion(self):
+        notion = _page('<p>Some intro</p><p>Regular content</p>')
+        onenote = _page(
+            '<p>Some intro</p>'
+            '<p style="color:red">Teacher feedback here</p>'
+            '<p>Regular content</p>'
+        )
+        result = merge_html(notion, onenote)
+        assert "Teacher feedback here" in result
 
 
 class TestNoRedInOutput:
@@ -176,21 +222,3 @@ class TestNoRedInOutput:
         html = rich_text_to_html(rt)
         assert "color:red" not in html.lower()
         assert "#C23B22" in html
-
-
-class TestFingerprintInOutput:
-    def test_paragraph_has_fingerprint(self):
-        from block_converter import blocks_to_html
-        blocks = [{"type": "paragraph", "paragraph": {"rich_text": [
-            {"plain_text": "Test", "text": {"content": "Test"}}
-        ]}}]
-        html = blocks_to_html(blocks)
-        assert SYNC_FINGERPRINT_STYLE in html
-
-    def test_heading_has_fingerprint(self):
-        from block_converter import blocks_to_html
-        blocks = [{"type": "heading_1", "heading_1": {"rich_text": [
-            {"plain_text": "Title", "text": {"content": "Title"}}
-        ]}}]
-        html = blocks_to_html(blocks)
-        assert SYNC_FINGERPRINT_STYLE in html
